@@ -78,6 +78,10 @@ db = mongo["global_ban_bot"]
 chats_col = db["chats"]
 users_col = db["users"]
 
+# Permanent global actions
+global_bans_col = db["global_bans"]
+global_mutes_col = db["global_mutes"]
+
 users_col.create_index(
     "username",
     sparse=True,
@@ -109,6 +113,7 @@ def save_user(user):
                 "username": username,
                 "first_name": user.first_name or "",
                 "last_name": user.last_name or "",
+                "updated_at": datetime.utcnow(),
             }
         },
         upsert=True,
@@ -126,6 +131,7 @@ def save_chat(chat):
                 "title": chat.title or "",
                 "username": chat.username or "",
                 "type": chat.type,
+                "updated_at": datetime.utcnow(),
             }
         },
         upsert=True,
@@ -146,8 +152,7 @@ def resolve_user(value: str):
     @username
     username
 
-    Username must have been seen by the bot
-    previously.
+    Username must have been seen by the bot previously.
     """
 
     if not value:
@@ -155,20 +160,13 @@ def resolve_user(value: str):
 
     value = value.strip()
 
-    # -----------------------------------------------------
-    # USER ID
-    # -----------------------------------------------------
-
+    # User ID
     try:
         return int(value)
-
     except ValueError:
         pass
 
-    # -----------------------------------------------------
-    # USERNAME
-    # -----------------------------------------------------
-
+    # Username
     username = value.lstrip("@").lower()
 
     user = users_col.find_one(
@@ -183,9 +181,6 @@ def resolve_user(value: str):
 
 
 def get_reply_user(update: Update):
-    """
-    Returns the user whose message was replied to.
-    """
 
     if not update.message:
         return None
@@ -198,22 +193,18 @@ def get_reply_user(update: Update):
     return replied.from_user
 
 
-def get_user_mention(user_id: int, username: str = "", first_name: str = "User"):
-    """
-    Creates a clickable Telegram mention.
-
-    If username exists:
-        @username
-
-    Otherwise:
-        clickable first name using tg://user?id=
-    """
+def get_user_mention(
+    user_id: int,
+    username: str = "",
+    first_name: str = "User",
+):
 
     if username:
-        safe_username = escape(username.lstrip("@"))
-        return f"@{safe_username}"
+        return f"@{escape(username.lstrip('@'))}"
 
-    safe_name = escape(first_name or "User")
+    safe_name = escape(
+        first_name or "User"
+    )
 
     return (
         f'<a href="tg://user?id={user_id}">'
@@ -222,46 +213,16 @@ def get_user_mention(user_id: int, username: str = "", first_name: str = "User")
     )
 
 
-def get_target_name(
-    user_id: int,
-    target_data=None,
-    reply_user=None,
-):
-    """
-    Gets best available target display name.
-    """
-
-    username = ""
-    first_name = "User"
-
-    if reply_user:
-
-        username = reply_user.username or ""
-        first_name = reply_user.first_name or "User"
-
-    elif target_data:
-
-        username = (
-            target_data.get("username")
-            or ""
-        )
-
-        first_name = (
-            target_data.get("first_name")
-            or "User"
-        )
-
-    return get_user_mention(
-        user_id=user_id,
-        username=username,
-        first_name=first_name,
+def current_time():
+    return datetime.now().strftime(
+        "%d %b %Y • %H:%M:%S"
     )
 
 
 async def bot_is_admin(
     context: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
-) -> bool:
+):
 
     try:
 
@@ -288,49 +249,201 @@ async def bot_is_admin(
         return False
 
 
-def current_time():
-    return datetime.now().strftime(
-        "%d %b %Y • %H:%M:%S"
+def get_target_from_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    # First try argument
+    if context.args:
+
+        user_id = resolve_user(
+            context.args[0]
+        )
+
+        if user_id is not None:
+            return user_id
+
+    # Then reply
+    reply_user = get_reply_user(update)
+
+    if reply_user:
+        return reply_user.id
+
+    return None
+
+
+def get_reason(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    if not context.args:
+        return ""
+
+    first = context.args[0]
+
+    # Target + reason
+    if resolve_user(first) is not None:
+
+        return " ".join(
+            context.args[1:]
+        ).strip()
+
+    # Reply + reason
+    if get_reply_user(update):
+
+        return " ".join(
+            context.args
+        ).strip()
+
+    return ""
+
+
+def get_target_info(
+    user_id: int,
+    update: Update,
+):
+
+    reply_user = get_reply_user(update)
+
+    target_data = users_col.find_one(
+        {"_id": user_id}
+    )
+
+    if reply_user:
+
+        save_user(reply_user)
+
+        return (
+            reply_user.username or "",
+            reply_user.first_name or "User",
+        )
+
+    if target_data:
+
+        return (
+            target_data.get("username") or "",
+            target_data.get("first_name") or "User",
+        )
+
+    return "", "User"
+
+
+# =========================================================
+# GLOBAL DATABASE
+# =========================================================
+
+def add_global_ban(
+    user_id: int,
+    username: str = "",
+    first_name: str = "",
+    reason: str = "",
+    admin_id: int = 0,
+):
+
+    global_bans_col.update_one(
+        {"_id": user_id},
+        {
+            "$set": {
+                "username": username or "",
+                "first_name": first_name or "",
+                "reason": reason or "",
+                "admin_id": admin_id,
+                "created_at": datetime.utcnow(),
+            }
+        },
+        upsert=True,
+    )
+
+
+def remove_global_ban(user_id: int):
+
+    global_bans_col.delete_one(
+        {"_id": user_id}
+    )
+
+
+def is_global_banned(user_id: int) -> bool:
+
+    return (
+        global_bans_col.find_one(
+            {"_id": user_id},
+            {"_id": 1},
+        )
+        is not None
+    )
+
+
+def add_global_mute(
+    user_id: int,
+    username: str = "",
+    first_name: str = "",
+    reason: str = "",
+    admin_id: int = 0,
+):
+
+    global_mutes_col.update_one(
+        {"_id": user_id},
+        {
+            "$set": {
+                "username": username or "",
+                "first_name": first_name or "",
+                "reason": reason or "",
+                "admin_id": admin_id,
+                "created_at": datetime.utcnow(),
+            }
+        },
+        upsert=True,
+    )
+
+
+def remove_global_mute(user_id: int):
+
+    global_mutes_col.delete_one(
+        {"_id": user_id}
+    )
+
+
+def is_global_muted(user_id: int) -> bool:
+
+    return (
+        global_mutes_col.find_one(
+            {"_id": user_id},
+            {"_id": 1},
+        )
+        is not None
     )
 
 
 # =========================================================
-# LOGS
+# LOGGING
 # =========================================================
 
 async def send_action_log(
-    context: ContextTypes.DEFAULT_TYPE,
-    action: str,
-    target_id: int,
-    target_username: str,
-    target_first_name: str,
+    context,
+    action,
+    target_id,
+    target_username,
+    target_first_name,
     admin,
-    reason: str,
-    total: int,
-    success: int,
-    skipped: int,
-    failed: int,
+    reason,
+    total,
+    success,
+    skipped,
+    failed,
 ):
 
-    # -----------------------------------------------------
-    # TARGET MENTION
-    # -----------------------------------------------------
-
     target_mention = get_user_mention(
-        user_id=target_id,
-        username=target_username,
-        first_name=target_first_name,
+        target_id,
+        target_username,
+        target_first_name,
     )
 
-    # -----------------------------------------------------
-    # ADMIN
-    # -----------------------------------------------------
-
-    admin_name = escape(
-        admin.username
+    admin_display = (
+        f"@{escape(admin.username)}"
         if admin.username
-        else admin.full_name
-        or "Admin"
+        else escape(admin.full_name or "Admin")
     )
 
     if action == "GBAN":
@@ -353,24 +466,19 @@ async def send_action_log(
         title = "🔊 <b>GLOBAL UNMUTE</b>"
         result_name = "Unmuted"
 
-    safe_reason = escape(
-        reason if reason else "Not specified"
-    )
-
     text = (
         f"{title}\n\n"
 
         f"👤 <b>Target:</b> {target_mention}\n"
-
         f"🆔 <b>Target ID:</b> "
         f"<code>{target_id}</code>\n\n"
 
-        f"👮 <b>Action By:</b> @{admin_name}\n"
-
+        f"👮 <b>Action By:</b> {admin_display}\n"
         f"🆔 <b>Admin ID:</b> "
         f"<code>{admin.id}</code>\n\n"
 
-        f"📝 <b>Reason:</b> {safe_reason}\n\n"
+        f"📝 <b>Reason:</b> "
+        f"{escape(reason or 'Not specified')}\n\n"
 
         f"📦 <b>Total Chats:</b> {total}\n"
         f"✅ <b>{result_name}:</b> {success}\n"
@@ -397,7 +505,7 @@ async def send_action_log(
 
 
 # =========================================================
-# BOT MEMBERSHIP UPDATE
+# BOT MEMBERSHIP
 # =========================================================
 
 async def bot_membership_update(
@@ -417,10 +525,7 @@ async def bot_membership_update(
 
     new_status = event.new_chat_member.status
 
-    # -----------------------------------------------------
-    # BOT BECAME ADMIN
-    # -----------------------------------------------------
-
+    # Bot became admin
     if new_status in (
         ChatMemberStatus.ADMINISTRATOR,
         ChatMemberStatus.OWNER,
@@ -429,16 +534,18 @@ async def bot_membership_update(
         save_chat(chat)
 
         logger.info(
-            "CHAT REGISTERED | %s | %s | %s",
+            "CHAT REGISTERED | %s | %s",
             chat.id,
             chat.title,
-            chat.type,
         )
 
-    # -----------------------------------------------------
-    # BOT LEFT / REMOVED
-    # -----------------------------------------------------
+        # -------------------------------------------------
+        # When bot becomes admin in a new chat,
+        # automatically apply existing global bans/mutes
+        # to users only when Telegram gives us member updates.
+        # -------------------------------------------------
 
+    # Bot left
     elif new_status in (
         ChatMemberStatus.LEFT,
         ChatMemberStatus.BANNED,
@@ -451,6 +558,155 @@ async def bot_membership_update(
             chat.id,
             chat.title,
         )
+
+
+# =========================================================
+# USER CHAT MEMBER UPDATE
+# =========================================================
+
+async def user_membership_update(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    event = update.chat_member
+
+    if not event:
+        return
+
+    chat = update.effective_chat
+
+    if not chat:
+        return
+
+    member = event.new_chat_member
+
+    user = member.user
+
+    if not user:
+        return
+
+    # Save every user we see
+    save_user(user)
+
+    # Ignore bots
+    if user.is_bot:
+        return
+
+    new_status = member.status
+
+    # -----------------------------------------------------
+    # USER JOINED / BECAME MEMBER
+    # -----------------------------------------------------
+
+    if new_status in (
+        ChatMemberStatus.MEMBER,
+        ChatMemberStatus.ADMINISTRATOR,
+        ChatMemberStatus.OWNER,
+    ):
+
+        # =================================================
+        # GLOBAL BAN CHECK
+        # =================================================
+
+        if is_global_banned(user.id):
+
+            try:
+
+                if await bot_is_admin(
+                    context,
+                    chat.id,
+                ):
+
+                    await context.bot.ban_chat_member(
+                        chat_id=chat.id,
+                        user_id=user.id,
+                        revoke_messages=True,
+                    )
+
+                    logger.info(
+                        "AUTO GBAN | User=%s | Chat=%s",
+                        user.id,
+                        chat.id,
+                    )
+
+                    return
+
+            except Forbidden:
+
+                logger.warning(
+                    "AUTO GBAN FORBIDDEN | User=%s | Chat=%s",
+                    user.id,
+                    chat.id,
+                )
+
+            except TelegramError as e:
+
+                logger.warning(
+                    "AUTO GBAN FAILED | User=%s | Chat=%s | %s",
+                    user.id,
+                    chat.id,
+                    e,
+                )
+
+        # =================================================
+        # GLOBAL MUTE CHECK
+        # =================================================
+
+        if is_global_muted(user.id):
+
+            mute_permissions = ChatPermissions(
+                can_send_messages=False,
+                can_send_audios=False,
+                can_send_documents=False,
+                can_send_photos=False,
+                can_send_videos=False,
+                can_send_video_notes=False,
+                can_send_voice_notes=False,
+                can_send_polls=False,
+                can_send_other_messages=False,
+                can_add_web_page_previews=False,
+                can_change_info=False,
+                can_invite_users=False,
+                can_pin_messages=False,
+                can_manage_topics=False,
+            )
+
+            try:
+
+                if await bot_is_admin(
+                    context,
+                    chat.id,
+                ):
+
+                    await context.bot.restrict_chat_member(
+                        chat_id=chat.id,
+                        user_id=user.id,
+                        permissions=mute_permissions,
+                    )
+
+                    logger.info(
+                        "AUTO GMUTE | User=%s | Chat=%s",
+                        user.id,
+                        chat.id,
+                    )
+
+            except Forbidden:
+
+                logger.warning(
+                    "AUTO GMUTE FORBIDDEN | User=%s | Chat=%s",
+                    user.id,
+                    chat.id,
+                )
+
+            except TelegramError as e:
+
+                logger.warning(
+                    "AUTO GMUTE FAILED | User=%s | Chat=%s | %s",
+                    user.id,
+                    chat.id,
+                    e,
+                )
 
 
 # =========================================================
@@ -470,19 +726,19 @@ async def start(
     text = (
         "🛡️ <b>GLOBAL BAN BOT</b>\n\n"
 
-        "🔨 <code>/gban USER_ID reason</code>\n"
+        "🔨 <code>/gban 123456789 reason</code>\n"
         "🔨 <code>/gban @username reason</code>\n"
         "🔨 <code>Reply → /gban reason</code>\n\n"
 
-        "♻️ <code>/ungban USER_ID</code>\n"
+        "♻️ <code>/ungban 123456789</code>\n"
         "♻️ <code>/ungban @username</code>\n"
         "♻️ <code>Reply → /ungban</code>\n\n"
 
-        "🔇 <code>/gmute USER_ID reason</code>\n"
+        "🔇 <code>/gmute 123456789 reason</code>\n"
         "🔇 <code>/gmute @username reason</code>\n"
         "🔇 <code>Reply → /gmute reason</code>\n\n"
 
-        "🔊 <code>/ungmute USER_ID</code>\n"
+        "🔊 <code>/ungmute 123456789</code>\n"
         "🔊 <code>/ungmute @username</code>\n"
         "🔊 <code>Reply → /ungmute</code>\n\n"
 
@@ -493,76 +749,6 @@ async def start(
         text,
         parse_mode="HTML",
     )
-
-
-# =========================================================
-# TARGET RESOLUTION
-# =========================================================
-
-def get_target_from_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    # -----------------------------------------------------
-    # FIRST: COMMAND ARGUMENT
-    # -----------------------------------------------------
-
-    if context.args:
-
-        target = context.args[0]
-
-        user_id = resolve_user(target)
-
-        if user_id is not None:
-            return user_id
-
-    # -----------------------------------------------------
-    # SECOND: REPLY USER
-    # -----------------------------------------------------
-
-    reply_user = get_reply_user(update)
-
-    if reply_user:
-
-        return reply_user.id
-
-    return None
-
-
-def get_reason(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if not context.args:
-        return ""
-
-    first = context.args[0]
-
-    # -----------------------------------------------------
-    # TARGET WAS FIRST ARGUMENT
-    # -----------------------------------------------------
-
-    if resolve_user(first) is not None:
-
-        return " ".join(
-            context.args[1:]
-        ).strip()
-
-    # -----------------------------------------------------
-    # REPLY COMMAND
-    # -----------------------------------------------------
-
-    if get_reply_user(update):
-
-        return " ".join(
-            context.args
-        ).strip()
-
-    return " ".join(
-        context.args[1:]
-    ).strip()
 
 
 # =========================================================
@@ -584,7 +770,6 @@ async def gban(
         await update.message.reply_text(
             "❌ You are not authorized."
         )
-
         return
 
     save_user(admin)
@@ -593,12 +778,9 @@ async def gban(
 
         await update.message.reply_text(
             "Usage:\n\n"
-
             "/gban 123456789 Spam\n\n"
-
             "/gban @username Spam\n\n"
-
-            "അല്ലെങ്കിൽ User message reply ചെയ്ത്:\n"
+            "Reply ചെയ്ത്:\n"
             "/gban Spam"
         )
 
@@ -613,7 +795,6 @@ async def gban(
 
         await update.message.reply_text(
             "❌ User not found.\n\n"
-
             "User ID / @username ഉപയോഗിക്കുക.\n"
             "അല്ലെങ്കിൽ User message reply ചെയ്യുക."
         )
@@ -625,40 +806,22 @@ async def gban(
         context,
     )
 
-    reply_user = get_reply_user(update)
-
-    target_data = users_col.find_one(
-        {"_id": user_id}
+    username, first_name = get_target_info(
+        user_id,
+        update,
     )
 
-    if reply_user:
+    # =====================================================
+    # SAVE PERMANENT GLOBAL BAN
+    # =====================================================
 
-        save_user(reply_user)
-
-        target_username = (
-            reply_user.username or ""
-        )
-
-        target_first_name = (
-            reply_user.first_name or "User"
-        )
-
-    elif target_data:
-
-        target_username = (
-            target_data.get("username")
-            or ""
-        )
-
-        target_first_name = (
-            target_data.get("first_name")
-            or "User"
-        )
-
-    else:
-
-        target_username = ""
-        target_first_name = "User"
+    add_global_ban(
+        user_id=user_id,
+        username=username,
+        first_name=first_name,
+        reason=reason,
+        admin_id=admin.id,
+    )
 
     chats = list(
         chats_col.find({})
@@ -667,25 +830,33 @@ async def gban(
     if not chats:
 
         await update.message.reply_text(
-            "📭 No registered chats found."
+            "🛡️ Global ban saved.\n"
+            "📭 No registered chats currently."
         )
 
         return
 
+    target_mention = get_user_mention(
+        user_id,
+        username,
+        first_name,
+    )
+
     status_message = await update.message.reply_text(
         "🔨 <b>GLOBAL BAN STARTED...</b>\n\n"
 
-        f"👤 Target: "
-        f"{get_user_mention(user_id, target_username, target_first_name)}\n"
+        f"👤 Target: {target_mention}\n"
+        f"🆔 ID: <code>{user_id}</code>\n\n"
 
-        f"🆔 ID: <code>{user_id}</code>\n"
+        "🛡️ <b>Permanent global ban saved.</b>\n"
+        "New joins will also be automatically banned.\n\n"
+
         f"📦 Chats: {len(chats)}",
 
         parse_mode="HTML",
     )
 
     total = len(chats)
-
     banned = 0
     skipped = 0
     failed = 0
@@ -732,23 +903,20 @@ async def gban(
             failed += 1
 
             logger.exception(
-                "Unexpected GBAN error: %s",
+                "GBAN ERROR | %s",
                 e,
             )
 
         await asyncio.sleep(0.15)
-
-    target_mention = get_user_mention(
-        user_id,
-        target_username,
-        target_first_name,
-    )
 
     result = (
         "🔨 <b>GLOBAL BAN COMPLETED</b>\n\n"
 
         f"👤 <b>Target:</b> {target_mention}\n"
         f"🆔 <b>ID:</b> <code>{user_id}</code>\n\n"
+
+        "🛡️ <b>Permanent Global Ban: ON</b>\n"
+        "🚫 Future joins: <b>AUTO BAN</b>\n\n"
 
         f"📦 <b>Total:</b> {total}\n"
         f"✅ <b>Banned:</b> {banned}\n"
@@ -762,17 +930,17 @@ async def gban(
     )
 
     await send_action_log(
-        context=context,
-        action="GBAN",
-        target_id=user_id,
-        target_username=target_username,
-        target_first_name=target_first_name,
-        admin=admin,
-        reason=reason,
-        total=total,
-        success=banned,
-        skipped=skipped,
-        failed=failed,
+        context,
+        "GBAN",
+        user_id,
+        username,
+        first_name,
+        admin,
+        reason,
+        total,
+        banned,
+        skipped,
+        failed,
     )
 
 
@@ -795,7 +963,6 @@ async def ungban(
         await update.message.reply_text(
             "❌ You are not authorized."
         )
-
         return
 
     save_user(admin)
@@ -804,12 +971,9 @@ async def ungban(
 
         await update.message.reply_text(
             "Usage:\n\n"
-
             "/ungban 123456789\n"
             "/ungban @username\n\n"
-
-            "അല്ലെങ്കിൽ User message reply ചെയ്ത്:\n"
-            "/ungban"
+            "അല്ലെങ്കിൽ reply ചെയ്ത് /ungban"
         )
 
         return
@@ -822,9 +986,7 @@ async def ungban(
     if user_id is None:
 
         await update.message.reply_text(
-            "❌ User not found.\n\n"
-            "User ID / @username ഉപയോഗിക്കുക.\n"
-            "അല്ലെങ്കിൽ User message reply ചെയ്യുക."
+            "❌ User not found."
         )
 
         return
@@ -834,28 +996,13 @@ async def ungban(
         context,
     )
 
-    reply_user = get_reply_user(update)
-
-    target_data = users_col.find_one(
-        {"_id": user_id}
+    username, first_name = get_target_info(
+        user_id,
+        update,
     )
 
-    if reply_user:
-
-        save_user(reply_user)
-
-        target_username = reply_user.username or ""
-        target_first_name = reply_user.first_name or "User"
-
-    elif target_data:
-
-        target_username = target_data.get("username") or ""
-        target_first_name = target_data.get("first_name") or "User"
-
-    else:
-
-        target_username = ""
-        target_first_name = "User"
+    # Remove permanent ban
+    remove_global_ban(user_id)
 
     chats = list(
         chats_col.find({})
@@ -864,25 +1011,31 @@ async def ungban(
     if not chats:
 
         await update.message.reply_text(
-            "📭 No registered chats found."
+            "♻️ Global ban removed."
         )
 
         return
 
+    target_mention = get_user_mention(
+        user_id,
+        username,
+        first_name,
+    )
+
     status_message = await update.message.reply_text(
         "♻️ <b>GLOBAL UNGBAN STARTED...</b>\n\n"
 
-        f"👤 Target: "
-        f"{get_user_mention(user_id, target_username, target_first_name)}\n"
+        f"👤 Target: {target_mention}\n"
+        f"🆔 ID: <code>{user_id}</code>\n\n"
 
-        f"🆔 ID: <code>{user_id}</code>\n"
+        "🛡️ <b>Permanent Global Ban: OFF</b>\n\n"
+
         f"📦 Chats: {len(chats)}",
 
         parse_mode="HTML",
     )
 
     total = len(chats)
-
     unbanned = 0
     skipped = 0
     failed = 0
@@ -918,9 +1071,7 @@ async def ungban(
             failed += 1
 
             logger.warning(
-                "UNGBAN FAILED | User=%s | Chat=%s | %s",
-                user_id,
-                chat_id,
+                "UNGBAN FAILED | %s",
                 e,
             )
 
@@ -929,23 +1080,20 @@ async def ungban(
             failed += 1
 
             logger.exception(
-                "Unexpected UNGBAN error: %s",
+                "UNGBAN ERROR | %s",
                 e,
             )
 
         await asyncio.sleep(0.15)
-
-    target_mention = get_user_mention(
-        user_id,
-        target_username,
-        target_first_name,
-    )
 
     result = (
         "♻️ <b>GLOBAL UNGBAN COMPLETED</b>\n\n"
 
         f"👤 <b>Target:</b> {target_mention}\n"
         f"🆔 <b>ID:</b> <code>{user_id}</code>\n\n"
+
+        "🛡️ <b>Permanent Global Ban: OFF</b>\n"
+        "✅ Future joins will NOT be auto-banned.\n\n"
 
         f"📦 <b>Total:</b> {total}\n"
         f"✅ <b>Unbanned:</b> {unbanned}\n"
@@ -959,17 +1107,17 @@ async def ungban(
     )
 
     await send_action_log(
-        context=context,
-        action="UNGBAN",
-        target_id=user_id,
-        target_username=target_username,
-        target_first_name=target_first_name,
-        admin=admin,
-        reason=reason,
-        total=total,
-        success=unbanned,
-        skipped=skipped,
-        failed=failed,
+        context,
+        "UNGBAN",
+        user_id,
+        username,
+        first_name,
+        admin,
+        reason,
+        total,
+        unbanned,
+        skipped,
+        failed,
     )
 
 
@@ -992,7 +1140,6 @@ async def gmute(
         await update.message.reply_text(
             "❌ You are not authorized."
         )
-
         return
 
     save_user(admin)
@@ -1001,12 +1148,9 @@ async def gmute(
 
         await update.message.reply_text(
             "Usage:\n\n"
-
-            "/gmute 123456789 Spam\n\n"
-
+            "/gmute 123456789 Spam\n"
             "/gmute @username Spam\n\n"
-
-            "അല്ലെങ്കിൽ User message reply ചെയ്ത്:\n"
+            "Reply ചെയ്ത്:\n"
             "/gmute Spam"
         )
 
@@ -1020,10 +1164,7 @@ async def gmute(
     if user_id is None:
 
         await update.message.reply_text(
-            "❌ User not found.\n\n"
-
-            "User ID / @username ഉപയോഗിക്കുക.\n"
-            "അല്ലെങ്കിൽ User message reply ചെയ്യുക."
+            "❌ User not found."
         )
 
         return
@@ -1033,28 +1174,22 @@ async def gmute(
         context,
     )
 
-    reply_user = get_reply_user(update)
-
-    target_data = users_col.find_one(
-        {"_id": user_id}
+    username, first_name = get_target_info(
+        user_id,
+        update,
     )
 
-    if reply_user:
+    # =====================================================
+    # SAVE PERMANENT GLOBAL MUTE
+    # =====================================================
 
-        save_user(reply_user)
-
-        target_username = reply_user.username or ""
-        target_first_name = reply_user.first_name or "User"
-
-    elif target_data:
-
-        target_username = target_data.get("username") or ""
-        target_first_name = target_data.get("first_name") or "User"
-
-    else:
-
-        target_username = ""
-        target_first_name = "User"
+    add_global_mute(
+        user_id=user_id,
+        username=username,
+        first_name=first_name,
+        reason=reason,
+        admin_id=admin.id,
+    )
 
     chats = list(
         chats_col.find({})
@@ -1063,32 +1198,31 @@ async def gmute(
     if not chats:
 
         await update.message.reply_text(
-            "📭 No registered chats found."
+            "🔇 Global mute saved.\n"
+            "📭 No registered chats currently."
         )
 
         return
 
+    target_mention = get_user_mention(
+        user_id,
+        username,
+        first_name,
+    )
+
     status_message = await update.message.reply_text(
         "🔇 <b>GLOBAL MUTE STARTED...</b>\n\n"
 
-        f"👤 Target: "
-        f"{get_user_mention(user_id, target_username, target_first_name)}\n"
+        f"👤 Target: {target_mention}\n"
+        f"🆔 ID: <code>{user_id}</code>\n\n"
 
-        f"🆔 ID: <code>{user_id}</code>\n"
+        "🛡️ <b>Permanent global mute saved.</b>\n"
+        "New joins will also be automatically muted.\n\n"
+
         f"📦 Chats: {len(chats)}",
 
         parse_mode="HTML",
     )
-
-    total = len(chats)
-
-    muted = 0
-    skipped = 0
-    failed = 0
-
-    # -----------------------------------------------------
-    # ALL MESSAGE PERMISSIONS OFF
-    # -----------------------------------------------------
 
     mute_permissions = ChatPermissions(
         can_send_messages=False,
@@ -1106,6 +1240,11 @@ async def gmute(
         can_pin_messages=False,
         can_manage_topics=False,
     )
+
+    total = len(chats)
+    muted = 0
+    skipped = 0
+    failed = 0
 
     for chat in chats:
 
@@ -1138,9 +1277,7 @@ async def gmute(
             failed += 1
 
             logger.warning(
-                "GMUTE FAILED | User=%s | Chat=%s | %s",
-                user_id,
-                chat_id,
+                "GMUTE FAILED | %s",
                 e,
             )
 
@@ -1149,23 +1286,20 @@ async def gmute(
             failed += 1
 
             logger.exception(
-                "Unexpected GMUTE error: %s",
+                "GMUTE ERROR | %s",
                 e,
             )
 
         await asyncio.sleep(0.15)
-
-    target_mention = get_user_mention(
-        user_id,
-        target_username,
-        target_first_name,
-    )
 
     result = (
         "🔇 <b>GLOBAL MUTE COMPLETED</b>\n\n"
 
         f"👤 <b>Target:</b> {target_mention}\n"
         f"🆔 <b>ID:</b> <code>{user_id}</code>\n\n"
+
+        "🛡️ <b>Permanent Global Mute: ON</b>\n"
+        "🔇 Future joins: <b>AUTO MUTE</b>\n\n"
 
         f"📦 <b>Total:</b> {total}\n"
         f"🔇 <b>Muted:</b> {muted}\n"
@@ -1179,17 +1313,17 @@ async def gmute(
     )
 
     await send_action_log(
-        context=context,
-        action="GMUTE",
-        target_id=user_id,
-        target_username=target_username,
-        target_first_name=target_first_name,
-        admin=admin,
-        reason=reason,
-        total=total,
-        success=muted,
-        skipped=skipped,
-        failed=failed,
+        context,
+        "GMUTE",
+        user_id,
+        username,
+        first_name,
+        admin,
+        reason,
+        total,
+        muted,
+        skipped,
+        failed,
     )
 
 
@@ -1212,7 +1346,6 @@ async def ungmute(
         await update.message.reply_text(
             "❌ You are not authorized."
         )
-
         return
 
     save_user(admin)
@@ -1221,12 +1354,9 @@ async def ungmute(
 
         await update.message.reply_text(
             "Usage:\n\n"
-
             "/ungmute 123456789\n"
             "/ungmute @username\n\n"
-
-            "അല്ലെങ്കിൽ User message reply ചെയ്ത്:\n"
-            "/ungmute"
+            "Reply ചെയ്ത് /ungmute"
         )
 
         return
@@ -1239,10 +1369,7 @@ async def ungmute(
     if user_id is None:
 
         await update.message.reply_text(
-            "❌ User not found.\n\n"
-
-            "User ID / @username ഉപയോഗിക്കുക.\n"
-            "അല്ലെങ്കിൽ User message reply ചെയ്യുക."
+            "❌ User not found."
         )
 
         return
@@ -1252,28 +1379,13 @@ async def ungmute(
         context,
     )
 
-    reply_user = get_reply_user(update)
-
-    target_data = users_col.find_one(
-        {"_id": user_id}
+    username, first_name = get_target_info(
+        user_id,
+        update,
     )
 
-    if reply_user:
-
-        save_user(reply_user)
-
-        target_username = reply_user.username or ""
-        target_first_name = reply_user.first_name or "User"
-
-    elif target_data:
-
-        target_username = target_data.get("username") or ""
-        target_first_name = target_data.get("first_name") or "User"
-
-    else:
-
-        target_username = ""
-        target_first_name = "User"
+    # Remove permanent mute
+    remove_global_mute(user_id)
 
     chats = list(
         chats_col.find({})
@@ -1282,32 +1394,29 @@ async def ungmute(
     if not chats:
 
         await update.message.reply_text(
-            "📭 No registered chats found."
+            "🔊 Global mute removed."
         )
 
         return
 
+    target_mention = get_user_mention(
+        user_id,
+        username,
+        first_name,
+    )
+
     status_message = await update.message.reply_text(
         "🔊 <b>GLOBAL UNMUTE STARTED...</b>\n\n"
 
-        f"👤 Target: "
-        f"{get_user_mention(user_id, target_username, target_first_name)}\n"
+        f"👤 Target: {target_mention}\n"
+        f"🆔 ID: <code>{user_id}</code>\n\n"
 
-        f"🆔 ID: <code>{user_id}</code>\n"
+        "🛡️ <b>Permanent Global Mute: OFF</b>\n\n"
+
         f"📦 Chats: {len(chats)}",
 
         parse_mode="HTML",
     )
-
-    total = len(chats)
-
-    unmuted = 0
-    skipped = 0
-    failed = 0
-
-    # -----------------------------------------------------
-    # NORMAL MEMBER PERMISSIONS
-    # -----------------------------------------------------
 
     normal_permissions = ChatPermissions(
         can_send_messages=True,
@@ -1325,6 +1434,11 @@ async def ungmute(
         can_pin_messages=False,
         can_manage_topics=False,
     )
+
+    total = len(chats)
+    unmuted = 0
+    skipped = 0
+    failed = 0
 
     for chat in chats:
 
@@ -1357,9 +1471,7 @@ async def ungmute(
             failed += 1
 
             logger.warning(
-                "UNGMUTE FAILED | User=%s | Chat=%s | %s",
-                user_id,
-                chat_id,
+                "UNGMUTE FAILED | %s",
                 e,
             )
 
@@ -1368,23 +1480,20 @@ async def ungmute(
             failed += 1
 
             logger.exception(
-                "Unexpected UNGMUTE error: %s",
+                "UNGMUTE ERROR | %s",
                 e,
             )
 
         await asyncio.sleep(0.15)
-
-    target_mention = get_user_mention(
-        user_id,
-        target_username,
-        target_first_name,
-    )
 
     result = (
         "🔊 <b>GLOBAL UNMUTE COMPLETED</b>\n\n"
 
         f"👤 <b>Target:</b> {target_mention}\n"
         f"🆔 <b>ID:</b> <code>{user_id}</code>\n\n"
+
+        "🛡️ <b>Permanent Global Mute: OFF</b>\n"
+        "✅ Future joins will NOT be auto-muted.\n\n"
 
         f"📦 <b>Total:</b> {total}\n"
         f"🔊 <b>Unmuted:</b> {unmuted}\n"
@@ -1398,22 +1507,22 @@ async def ungmute(
     )
 
     await send_action_log(
-        context=context,
-        action="UNGMUTE",
-        target_id=user_id,
-        target_username=target_username,
-        target_first_name=target_first_name,
-        admin=admin,
-        reason=reason,
-        total=total,
-        success=unmuted,
-        skipped=skipped,
-        failed=failed,
+        context,
+        "UNGMUTE",
+        user_id,
+        username,
+        first_name,
+        admin,
+        reason,
+        total,
+        unmuted,
+        skipped,
+        failed,
     )
 
 
 # =========================================================
-# /CHATS
+# CHATS
 # =========================================================
 
 async def chats(
@@ -1431,7 +1540,6 @@ async def chats(
         await update.message.reply_text(
             "❌ You are not authorized."
         )
-
         return
 
     all_chats = list(
@@ -1446,9 +1554,7 @@ async def chats(
 
         return
 
-    text = (
-        "📋 <b>REGISTERED CHATS</b>\n\n"
-    )
+    text = "📋 <b>REGISTERED CHATS</b>\n\n"
 
     for i, chat in enumerate(
         all_chats,
@@ -1492,87 +1598,43 @@ def main():
     )
 
     # -----------------------------------------------------
-    # START
+    # COMMANDS
     # -----------------------------------------------------
 
     app.add_handler(
-        CommandHandler(
-            "start",
-            start,
-        )
-    )
-
-    # -----------------------------------------------------
-    # GBAN
-    # -----------------------------------------------------
-
-    app.add_handler(
-        CommandHandler(
-            "gban",
-            gban,
-        )
-    )
-
-    # -----------------------------------------------------
-    # UNGBAN
-    # -----------------------------------------------------
-
-    app.add_handler(
-        CommandHandler(
-            "ungban",
-            ungban,
-        )
+        CommandHandler("start", start)
     )
 
     app.add_handler(
-        CommandHandler(
-            "unban",
-            ungban,
-        )
-    )
-
-    # -----------------------------------------------------
-    # GMUTE
-    # -----------------------------------------------------
-
-    app.add_handler(
-        CommandHandler(
-            "gmute",
-            gmute,
-        )
-    )
-
-    # -----------------------------------------------------
-    # UNGMUTE
-    # -----------------------------------------------------
-
-    app.add_handler(
-        CommandHandler(
-            "ungmute",
-            ungmute,
-        )
+        CommandHandler("gban", gban)
     )
 
     app.add_handler(
-        CommandHandler(
-            "unmute",
-            ungmute,
-        )
+        CommandHandler("ungban", ungban)
     )
-
-    # -----------------------------------------------------
-    # CHATS
-    # -----------------------------------------------------
 
     app.add_handler(
-        CommandHandler(
-            "chats",
-            chats,
-        )
+        CommandHandler("unban", ungban)
+    )
+
+    app.add_handler(
+        CommandHandler("gmute", gmute)
+    )
+
+    app.add_handler(
+        CommandHandler("ungmute", ungmute)
+    )
+
+    app.add_handler(
+        CommandHandler("unmute", ungmute)
+    )
+
+    app.add_handler(
+        CommandHandler("chats", chats)
     )
 
     # -----------------------------------------------------
-    # BOT MEMBERSHIP
+    # BOT JOIN / LEAVE
     # -----------------------------------------------------
 
     app.add_handler(
@@ -1583,7 +1645,18 @@ def main():
     )
 
     # -----------------------------------------------------
-    # LOG
+    # USER JOIN / LEAVE
+    # -----------------------------------------------------
+
+    app.add_handler(
+        ChatMemberHandler(
+            user_membership_update,
+            ChatMemberHandler.CHAT_MEMBER,
+        )
+    )
+
+    # -----------------------------------------------------
+    # START
     # -----------------------------------------------------
 
     logger.info(
@@ -1595,7 +1668,11 @@ def main():
     )
 
     logger.info(
-        "GBAN + UNGBAN + GMUTE + UNGMUTE"
+        "Permanent GBAN + Auto GBAN"
+    )
+
+    logger.info(
+        "Permanent GMUTE + Auto GMUTE"
     )
 
     logger.info(
