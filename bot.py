@@ -2,11 +2,14 @@ import os
 import asyncio
 import logging
 from datetime import datetime
+from html import escape
 
 from pymongo import MongoClient
-from telegram import Update
+
+from telegram import Update, ChatPermissions
 from telegram.constants import ChatMemberStatus
 from telegram.error import TelegramError, Forbidden
+
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -74,10 +77,6 @@ db = mongo["global_ban_bot"]
 
 chats_col = db["chats"]
 users_col = db["users"]
-
-# IMPORTANT:
-# Do NOT create an _id index manually.
-# MongoDB already creates a unique _id index automatically.
 
 users_col.create_index(
     "username",
@@ -151,10 +150,13 @@ def resolve_user(value: str):
     previously.
     """
 
+    if not value:
+        return None
+
     value = value.strip()
 
     # -----------------------------------------------------
-    # Telegram User ID
+    # USER ID
     # -----------------------------------------------------
 
     try:
@@ -164,24 +166,96 @@ def resolve_user(value: str):
         pass
 
     # -----------------------------------------------------
-    # Username
+    # USERNAME
     # -----------------------------------------------------
 
     username = value.lstrip("@").lower()
 
     user = users_col.find_one(
-        {
-            "username": username
-        },
-        {
-            "_id": 1
-        },
+        {"username": username},
+        {"_id": 1},
     )
 
     if user:
         return int(user["_id"])
 
     return None
+
+
+def get_reply_user(update: Update):
+    """
+    Returns the user whose message was replied to.
+    """
+
+    if not update.message:
+        return None
+
+    replied = update.message.reply_to_message
+
+    if not replied:
+        return None
+
+    return replied.from_user
+
+
+def get_user_mention(user_id: int, username: str = "", first_name: str = "User"):
+    """
+    Creates a clickable Telegram mention.
+
+    If username exists:
+        @username
+
+    Otherwise:
+        clickable first name using tg://user?id=
+    """
+
+    if username:
+        safe_username = escape(username.lstrip("@"))
+        return f"@{safe_username}"
+
+    safe_name = escape(first_name or "User")
+
+    return (
+        f'<a href="tg://user?id={user_id}">'
+        f"{safe_name}"
+        f"</a>"
+    )
+
+
+def get_target_name(
+    user_id: int,
+    target_data=None,
+    reply_user=None,
+):
+    """
+    Gets best available target display name.
+    """
+
+    username = ""
+    first_name = "User"
+
+    if reply_user:
+
+        username = reply_user.username or ""
+        first_name = reply_user.first_name or "User"
+
+    elif target_data:
+
+        username = (
+            target_data.get("username")
+            or ""
+        )
+
+        first_name = (
+            target_data.get("first_name")
+            or "User"
+        )
+
+    return get_user_mention(
+        user_id=user_id,
+        username=username,
+        first_name=first_name,
+    )
 
 
 async def bot_is_admin(
@@ -229,6 +303,7 @@ async def send_action_log(
     action: str,
     target_id: int,
     target_username: str,
+    target_first_name: str,
     admin,
     reason: str,
     total: int,
@@ -237,16 +312,25 @@ async def send_action_log(
     failed: int,
 ):
 
-    target_name = (
-        f"@{target_username}"
-        if target_username
-        else "No username"
+    # -----------------------------------------------------
+    # TARGET MENTION
+    # -----------------------------------------------------
+
+    target_mention = get_user_mention(
+        user_id=target_id,
+        username=target_username,
+        first_name=target_first_name,
     )
 
-    admin_name = (
-        f"@{admin.username}"
+    # -----------------------------------------------------
+    # ADMIN
+    # -----------------------------------------------------
+
+    admin_name = escape(
+        admin.username
         if admin.username
         else admin.full_name
+        or "Admin"
     )
 
     if action == "GBAN":
@@ -254,24 +338,39 @@ async def send_action_log(
         title = "🔨 <b>GLOBAL BAN</b>"
         result_name = "Banned"
 
-    else:
+    elif action == "UNGBAN":
 
         title = "♻️ <b>GLOBAL UNGBAN</b>"
         result_name = "Unbanned"
 
+    elif action == "GMUTE":
+
+        title = "🔇 <b>GLOBAL MUTE</b>"
+        result_name = "Muted"
+
+    else:
+
+        title = "🔊 <b>GLOBAL UNMUTE</b>"
+        result_name = "Unmuted"
+
+    safe_reason = escape(
+        reason if reason else "Not specified"
+    )
+
     text = (
         f"{title}\n\n"
 
-        f"👤 <b>Target:</b> {target_name}\n"
+        f"👤 <b>Target:</b> {target_mention}\n"
+
         f"🆔 <b>Target ID:</b> "
         f"<code>{target_id}</code>\n\n"
 
-        f"👮 <b>Action By:</b> {admin_name}\n"
+        f"👮 <b>Action By:</b> @{admin_name}\n"
+
         f"🆔 <b>Admin ID:</b> "
         f"<code>{admin.id}</code>\n\n"
 
-        f"📝 <b>Reason:</b> "
-        f"{reason if reason else 'Not specified'}\n\n"
+        f"📝 <b>Reason:</b> {safe_reason}\n\n"
 
         f"📦 <b>Total Chats:</b> {total}\n"
         f"✅ <b>{result_name}:</b> {success}\n"
@@ -319,7 +418,7 @@ async def bot_membership_update(
     new_status = event.new_chat_member.status
 
     # -----------------------------------------------------
-    # Bot became admin
+    # BOT BECAME ADMIN
     # -----------------------------------------------------
 
     if new_status in (
@@ -337,7 +436,7 @@ async def bot_membership_update(
         )
 
     # -----------------------------------------------------
-    # Bot left / removed
+    # BOT LEFT / REMOVED
     # -----------------------------------------------------
 
     elif new_status in (
@@ -371,13 +470,21 @@ async def start(
     text = (
         "🛡️ <b>GLOBAL BAN BOT</b>\n\n"
 
-        "🔨 <code>/gban USER_ID</code>\n"
         "🔨 <code>/gban USER_ID reason</code>\n"
-        "🔨 <code>/gban @username reason</code>\n\n"
+        "🔨 <code>/gban @username reason</code>\n"
+        "🔨 <code>Reply → /gban reason</code>\n\n"
 
         "♻️ <code>/ungban USER_ID</code>\n"
-        "♻️ <code>/ungban USER_ID reason</code>\n"
-        "♻️ <code>/ungban @username reason</code>\n\n"
+        "♻️ <code>/ungban @username</code>\n"
+        "♻️ <code>Reply → /ungban</code>\n\n"
+
+        "🔇 <code>/gmute USER_ID reason</code>\n"
+        "🔇 <code>/gmute @username reason</code>\n"
+        "🔇 <code>Reply → /gmute reason</code>\n\n"
+
+        "🔊 <code>/ungmute USER_ID</code>\n"
+        "🔊 <code>/ungmute @username</code>\n"
+        "🔊 <code>Reply → /ungmute</code>\n\n"
 
         "📋 <code>/chats</code>"
     )
@@ -386,6 +493,76 @@ async def start(
         text,
         parse_mode="HTML",
     )
+
+
+# =========================================================
+# TARGET RESOLUTION
+# =========================================================
+
+def get_target_from_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    # -----------------------------------------------------
+    # FIRST: COMMAND ARGUMENT
+    # -----------------------------------------------------
+
+    if context.args:
+
+        target = context.args[0]
+
+        user_id = resolve_user(target)
+
+        if user_id is not None:
+            return user_id
+
+    # -----------------------------------------------------
+    # SECOND: REPLY USER
+    # -----------------------------------------------------
+
+    reply_user = get_reply_user(update)
+
+    if reply_user:
+
+        return reply_user.id
+
+    return None
+
+
+def get_reason(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    if not context.args:
+        return ""
+
+    first = context.args[0]
+
+    # -----------------------------------------------------
+    # TARGET WAS FIRST ARGUMENT
+    # -----------------------------------------------------
+
+    if resolve_user(first) is not None:
+
+        return " ".join(
+            context.args[1:]
+        ).strip()
+
+    # -----------------------------------------------------
+    # REPLY COMMAND
+    # -----------------------------------------------------
+
+    if get_reply_user(update):
+
+        return " ".join(
+            context.args
+        ).strip()
+
+    return " ".join(
+        context.args[1:]
+    ).strip()
 
 
 # =========================================================
@@ -402,10 +579,6 @@ async def gban(
     if not admin:
         return
 
-    # -----------------------------------------------------
-    # OWNER / ADMIN CHECK
-    # -----------------------------------------------------
-
     if not is_owner(admin.id):
 
         await update.message.reply_text(
@@ -416,72 +589,76 @@ async def gban(
 
     save_user(admin)
 
-    # -----------------------------------------------------
-    # ARGUMENT CHECK
-    # -----------------------------------------------------
-
-    if not context.args:
+    if not context.args and not get_reply_user(update):
 
         await update.message.reply_text(
             "Usage:\n\n"
 
-            "/gban 123456789\n\n"
-
             "/gban 123456789 Spam\n\n"
 
-            "/gban @username Spam"
+            "/gban @username Spam\n\n"
+
+            "അല്ലെങ്കിൽ User message reply ചെയ്ത്:\n"
+            "/gban Spam"
         )
 
         return
 
-    target = context.args[0]
-
-    # Everything after target = reason
-    reason = " ".join(
-        context.args[1:]
-    ).strip()
-
-    # -----------------------------------------------------
-    # RESOLVE USER
-    # -----------------------------------------------------
-
-    user_id = resolve_user(target)
+    user_id = get_target_from_command(
+        update,
+        context,
+    )
 
     if user_id is None:
 
         await update.message.reply_text(
             "❌ User not found.\n\n"
 
-            "User ID ഉപയോഗിക്കുക.\n\n"
-
-            "Example:\n"
-            "/gban 123456789 Spam"
+            "User ID / @username ഉപയോഗിക്കുക.\n"
+            "അല്ലെങ്കിൽ User message reply ചെയ്യുക."
         )
 
         return
 
-    # -----------------------------------------------------
-    # GET USER DATA
-    # -----------------------------------------------------
-
-    target_data = users_col.find_one(
-        {
-            "_id": user_id
-        }
+    reason = get_reason(
+        update,
+        context,
     )
 
-    target_username = ""
+    reply_user = get_reply_user(update)
 
-    if target_data:
+    target_data = users_col.find_one(
+        {"_id": user_id}
+    )
+
+    if reply_user:
+
+        save_user(reply_user)
+
+        target_username = (
+            reply_user.username or ""
+        )
+
+        target_first_name = (
+            reply_user.first_name or "User"
+        )
+
+    elif target_data:
 
         target_username = (
             target_data.get("username")
             or ""
         )
 
-    # -----------------------------------------------------
-    # GET REGISTERED CHATS
-    # -----------------------------------------------------
+        target_first_name = (
+            target_data.get("first_name")
+            or "User"
+        )
+
+    else:
+
+        target_username = ""
+        target_first_name = "User"
 
     chats = list(
         chats_col.find({})
@@ -495,16 +672,13 @@ async def gban(
 
         return
 
-    # -----------------------------------------------------
-    # START MESSAGE
-    # -----------------------------------------------------
-
     status_message = await update.message.reply_text(
         "🔨 <b>GLOBAL BAN STARTED...</b>\n\n"
 
-        f"👤 Target ID: "
-        f"<code>{user_id}</code>\n"
+        f"👤 Target: "
+        f"{get_user_mention(user_id, target_username, target_first_name)}\n"
 
+        f"🆔 ID: <code>{user_id}</code>\n"
         f"📦 Chats: {len(chats)}",
 
         parse_mode="HTML",
@@ -516,32 +690,20 @@ async def gban(
     skipped = 0
     failed = 0
 
-    # -----------------------------------------------------
-    # BAN LOOP
-    # -----------------------------------------------------
-
     for chat in chats:
 
         chat_id = chat["_id"]
 
-        title = (
-            chat.get("title")
-            or str(chat_id)
-        )
-
         try:
 
-            # Check bot admin status
             if not await bot_is_admin(
                 context,
                 chat_id,
             ):
 
                 skipped += 1
-
                 continue
 
-            # Ban
             await context.bot.ban_chat_member(
                 chat_id=chat_id,
                 user_id=user_id,
@@ -550,32 +712,16 @@ async def gban(
 
             banned += 1
 
-            logger.info(
-                "GBAN SUCCESS | "
-                "User=%s | Chat=%s | %s",
-                user_id,
-                chat_id,
-                title,
-            )
-
         except Forbidden:
 
             skipped += 1
-
-            logger.warning(
-                "GBAN FORBIDDEN | "
-                "User=%s | Chat=%s",
-                user_id,
-                chat_id,
-            )
 
         except TelegramError as e:
 
             failed += 1
 
             logger.warning(
-                "GBAN FAILED | "
-                "User=%s | Chat=%s | %s",
+                "GBAN FAILED | User=%s | Chat=%s | %s",
                 user_id,
                 chat_id,
                 e,
@@ -590,21 +736,19 @@ async def gban(
                 e,
             )
 
-        # Small delay
         await asyncio.sleep(0.15)
 
-    # -----------------------------------------------------
-    # RESULT
-    # -----------------------------------------------------
+    target_mention = get_user_mention(
+        user_id,
+        target_username,
+        target_first_name,
+    )
 
     result = (
         "🔨 <b>GLOBAL BAN COMPLETED</b>\n\n"
 
-        f"👤 <b>Target:</b> "
-        f"{('@' + target_username) if target_username else 'No username'}\n"
-
-        f"🆔 <b>ID:</b> "
-        f"<code>{user_id}</code>\n\n"
+        f"👤 <b>Target:</b> {target_mention}\n"
+        f"🆔 <b>ID:</b> <code>{user_id}</code>\n\n"
 
         f"📦 <b>Total:</b> {total}\n"
         f"✅ <b>Banned:</b> {banned}\n"
@@ -617,15 +761,12 @@ async def gban(
         parse_mode="HTML",
     )
 
-    # -----------------------------------------------------
-    # LOG
-    # -----------------------------------------------------
-
     await send_action_log(
         context=context,
         action="GBAN",
         target_id=user_id,
         target_username=target_username,
+        target_first_name=target_first_name,
         admin=admin,
         reason=reason,
         total=total,
@@ -649,10 +790,6 @@ async def ungban(
     if not admin:
         return
 
-    # -----------------------------------------------------
-    # OWNER / ADMIN CHECK
-    # -----------------------------------------------------
-
     if not is_owner(admin.id):
 
         await update.message.reply_text(
@@ -663,67 +800,62 @@ async def ungban(
 
     save_user(admin)
 
-    # -----------------------------------------------------
-    # ARGUMENT CHECK
-    # -----------------------------------------------------
-
-    if not context.args:
+    if not context.args and not get_reply_user(update):
 
         await update.message.reply_text(
             "Usage:\n\n"
 
-            "/ungban 123456789\n\n"
+            "/ungban 123456789\n"
+            "/ungban @username\n\n"
 
-            "/ungban 123456789 Appeal accepted\n\n"
-
-            "/ungban @username Appeal accepted"
+            "അല്ലെങ്കിൽ User message reply ചെയ്ത്:\n"
+            "/ungban"
         )
 
         return
 
-    target = context.args[0]
-
-    reason = " ".join(
-        context.args[1:]
-    ).strip()
-
-    # -----------------------------------------------------
-    # RESOLVE USER
-    # -----------------------------------------------------
-
-    user_id = resolve_user(target)
+    user_id = get_target_from_command(
+        update,
+        context,
+    )
 
     if user_id is None:
 
         await update.message.reply_text(
             "❌ User not found.\n\n"
-            "User ID ഉപയോഗിക്കുക."
+            "User ID / @username ഉപയോഗിക്കുക.\n"
+            "അല്ലെങ്കിൽ User message reply ചെയ്യുക."
         )
 
         return
 
-    # -----------------------------------------------------
-    # USER DATA
-    # -----------------------------------------------------
-
-    target_data = users_col.find_one(
-        {
-            "_id": user_id
-        }
+    reason = get_reason(
+        update,
+        context,
     )
 
-    target_username = ""
+    reply_user = get_reply_user(update)
 
-    if target_data:
+    target_data = users_col.find_one(
+        {"_id": user_id}
+    )
 
-        target_username = (
-            target_data.get("username")
-            or ""
-        )
+    if reply_user:
 
-    # -----------------------------------------------------
-    # CHATS
-    # -----------------------------------------------------
+        save_user(reply_user)
+
+        target_username = reply_user.username or ""
+        target_first_name = reply_user.first_name or "User"
+
+    elif target_data:
+
+        target_username = target_data.get("username") or ""
+        target_first_name = target_data.get("first_name") or "User"
+
+    else:
+
+        target_username = ""
+        target_first_name = "User"
 
     chats = list(
         chats_col.find({})
@@ -737,16 +869,13 @@ async def ungban(
 
         return
 
-    # -----------------------------------------------------
-    # START
-    # -----------------------------------------------------
-
     status_message = await update.message.reply_text(
         "♻️ <b>GLOBAL UNGBAN STARTED...</b>\n\n"
 
-        f"👤 Target ID: "
-        f"<code>{user_id}</code>\n"
+        f"👤 Target: "
+        f"{get_user_mention(user_id, target_username, target_first_name)}\n"
 
+        f"🆔 ID: <code>{user_id}</code>\n"
         f"📦 Chats: {len(chats)}",
 
         parse_mode="HTML",
@@ -758,18 +887,9 @@ async def ungban(
     skipped = 0
     failed = 0
 
-    # -----------------------------------------------------
-    # UNBAN LOOP
-    # -----------------------------------------------------
-
     for chat in chats:
 
         chat_id = chat["_id"]
-
-        title = (
-            chat.get("title")
-            or str(chat_id)
-        )
 
         try:
 
@@ -779,7 +899,6 @@ async def ungban(
             ):
 
                 skipped += 1
-
                 continue
 
             await context.bot.unban_chat_member(
@@ -790,14 +909,6 @@ async def ungban(
 
             unbanned += 1
 
-            logger.info(
-                "UNGBAN SUCCESS | "
-                "User=%s | Chat=%s | %s",
-                user_id,
-                chat_id,
-                title,
-            )
-
         except Forbidden:
 
             skipped += 1
@@ -807,8 +918,7 @@ async def ungban(
             failed += 1
 
             logger.warning(
-                "UNGBAN FAILED | "
-                "User=%s | Chat=%s | %s",
+                "UNGBAN FAILED | User=%s | Chat=%s | %s",
                 user_id,
                 chat_id,
                 e,
@@ -825,18 +935,17 @@ async def ungban(
 
         await asyncio.sleep(0.15)
 
-    # -----------------------------------------------------
-    # RESULT
-    # -----------------------------------------------------
+    target_mention = get_user_mention(
+        user_id,
+        target_username,
+        target_first_name,
+    )
 
     result = (
         "♻️ <b>GLOBAL UNGBAN COMPLETED</b>\n\n"
 
-        f"👤 <b>Target:</b> "
-        f"{('@' + target_username) if target_username else 'No username'}\n"
-
-        f"🆔 <b>ID:</b> "
-        f"<code>{user_id}</code>\n\n"
+        f"👤 <b>Target:</b> {target_mention}\n"
+        f"🆔 <b>ID:</b> <code>{user_id}</code>\n\n"
 
         f"📦 <b>Total:</b> {total}\n"
         f"✅ <b>Unbanned:</b> {unbanned}\n"
@@ -849,19 +958,455 @@ async def ungban(
         parse_mode="HTML",
     )
 
-    # -----------------------------------------------------
-    # LOG
-    # -----------------------------------------------------
-
     await send_action_log(
         context=context,
         action="UNGBAN",
         target_id=user_id,
         target_username=target_username,
+        target_first_name=target_first_name,
         admin=admin,
         reason=reason,
         total=total,
         success=unbanned,
+        skipped=skipped,
+        failed=failed,
+    )
+
+
+# =========================================================
+# GLOBAL MUTE
+# =========================================================
+
+async def gmute(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    admin = update.effective_user
+
+    if not admin:
+        return
+
+    if not is_owner(admin.id):
+
+        await update.message.reply_text(
+            "❌ You are not authorized."
+        )
+
+        return
+
+    save_user(admin)
+
+    if not context.args and not get_reply_user(update):
+
+        await update.message.reply_text(
+            "Usage:\n\n"
+
+            "/gmute 123456789 Spam\n\n"
+
+            "/gmute @username Spam\n\n"
+
+            "അല്ലെങ്കിൽ User message reply ചെയ്ത്:\n"
+            "/gmute Spam"
+        )
+
+        return
+
+    user_id = get_target_from_command(
+        update,
+        context,
+    )
+
+    if user_id is None:
+
+        await update.message.reply_text(
+            "❌ User not found.\n\n"
+
+            "User ID / @username ഉപയോഗിക്കുക.\n"
+            "അല്ലെങ്കിൽ User message reply ചെയ്യുക."
+        )
+
+        return
+
+    reason = get_reason(
+        update,
+        context,
+    )
+
+    reply_user = get_reply_user(update)
+
+    target_data = users_col.find_one(
+        {"_id": user_id}
+    )
+
+    if reply_user:
+
+        save_user(reply_user)
+
+        target_username = reply_user.username or ""
+        target_first_name = reply_user.first_name or "User"
+
+    elif target_data:
+
+        target_username = target_data.get("username") or ""
+        target_first_name = target_data.get("first_name") or "User"
+
+    else:
+
+        target_username = ""
+        target_first_name = "User"
+
+    chats = list(
+        chats_col.find({})
+    )
+
+    if not chats:
+
+        await update.message.reply_text(
+            "📭 No registered chats found."
+        )
+
+        return
+
+    status_message = await update.message.reply_text(
+        "🔇 <b>GLOBAL MUTE STARTED...</b>\n\n"
+
+        f"👤 Target: "
+        f"{get_user_mention(user_id, target_username, target_first_name)}\n"
+
+        f"🆔 ID: <code>{user_id}</code>\n"
+        f"📦 Chats: {len(chats)}",
+
+        parse_mode="HTML",
+    )
+
+    total = len(chats)
+
+    muted = 0
+    skipped = 0
+    failed = 0
+
+    # -----------------------------------------------------
+    # ALL MESSAGE PERMISSIONS OFF
+    # -----------------------------------------------------
+
+    mute_permissions = ChatPermissions(
+        can_send_messages=False,
+        can_send_audios=False,
+        can_send_documents=False,
+        can_send_photos=False,
+        can_send_videos=False,
+        can_send_video_notes=False,
+        can_send_voice_notes=False,
+        can_send_polls=False,
+        can_send_other_messages=False,
+        can_add_web_page_previews=False,
+        can_change_info=False,
+        can_invite_users=False,
+        can_pin_messages=False,
+        can_manage_topics=False,
+    )
+
+    for chat in chats:
+
+        chat_id = chat["_id"]
+
+        try:
+
+            if not await bot_is_admin(
+                context,
+                chat_id,
+            ):
+
+                skipped += 1
+                continue
+
+            await context.bot.restrict_chat_member(
+                chat_id=chat_id,
+                user_id=user_id,
+                permissions=mute_permissions,
+            )
+
+            muted += 1
+
+        except Forbidden:
+
+            skipped += 1
+
+        except TelegramError as e:
+
+            failed += 1
+
+            logger.warning(
+                "GMUTE FAILED | User=%s | Chat=%s | %s",
+                user_id,
+                chat_id,
+                e,
+            )
+
+        except Exception as e:
+
+            failed += 1
+
+            logger.exception(
+                "Unexpected GMUTE error: %s",
+                e,
+            )
+
+        await asyncio.sleep(0.15)
+
+    target_mention = get_user_mention(
+        user_id,
+        target_username,
+        target_first_name,
+    )
+
+    result = (
+        "🔇 <b>GLOBAL MUTE COMPLETED</b>\n\n"
+
+        f"👤 <b>Target:</b> {target_mention}\n"
+        f"🆔 <b>ID:</b> <code>{user_id}</code>\n\n"
+
+        f"📦 <b>Total:</b> {total}\n"
+        f"🔇 <b>Muted:</b> {muted}\n"
+        f"⏭ <b>Skipped:</b> {skipped}\n"
+        f"❌ <b>Failed:</b> {failed}"
+    )
+
+    await status_message.edit_text(
+        result,
+        parse_mode="HTML",
+    )
+
+    await send_action_log(
+        context=context,
+        action="GMUTE",
+        target_id=user_id,
+        target_username=target_username,
+        target_first_name=target_first_name,
+        admin=admin,
+        reason=reason,
+        total=total,
+        success=muted,
+        skipped=skipped,
+        failed=failed,
+    )
+
+
+# =========================================================
+# GLOBAL UNMUTE
+# =========================================================
+
+async def ungmute(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    admin = update.effective_user
+
+    if not admin:
+        return
+
+    if not is_owner(admin.id):
+
+        await update.message.reply_text(
+            "❌ You are not authorized."
+        )
+
+        return
+
+    save_user(admin)
+
+    if not context.args and not get_reply_user(update):
+
+        await update.message.reply_text(
+            "Usage:\n\n"
+
+            "/ungmute 123456789\n"
+            "/ungmute @username\n\n"
+
+            "അല്ലെങ്കിൽ User message reply ചെയ്ത്:\n"
+            "/ungmute"
+        )
+
+        return
+
+    user_id = get_target_from_command(
+        update,
+        context,
+    )
+
+    if user_id is None:
+
+        await update.message.reply_text(
+            "❌ User not found.\n\n"
+
+            "User ID / @username ഉപയോഗിക്കുക.\n"
+            "അല്ലെങ്കിൽ User message reply ചെയ്യുക."
+        )
+
+        return
+
+    reason = get_reason(
+        update,
+        context,
+    )
+
+    reply_user = get_reply_user(update)
+
+    target_data = users_col.find_one(
+        {"_id": user_id}
+    )
+
+    if reply_user:
+
+        save_user(reply_user)
+
+        target_username = reply_user.username or ""
+        target_first_name = reply_user.first_name or "User"
+
+    elif target_data:
+
+        target_username = target_data.get("username") or ""
+        target_first_name = target_data.get("first_name") or "User"
+
+    else:
+
+        target_username = ""
+        target_first_name = "User"
+
+    chats = list(
+        chats_col.find({})
+    )
+
+    if not chats:
+
+        await update.message.reply_text(
+            "📭 No registered chats found."
+        )
+
+        return
+
+    status_message = await update.message.reply_text(
+        "🔊 <b>GLOBAL UNMUTE STARTED...</b>\n\n"
+
+        f"👤 Target: "
+        f"{get_user_mention(user_id, target_username, target_first_name)}\n"
+
+        f"🆔 ID: <code>{user_id}</code>\n"
+        f"📦 Chats: {len(chats)}",
+
+        parse_mode="HTML",
+    )
+
+    total = len(chats)
+
+    unmuted = 0
+    skipped = 0
+    failed = 0
+
+    # -----------------------------------------------------
+    # NORMAL MEMBER PERMISSIONS
+    # -----------------------------------------------------
+
+    normal_permissions = ChatPermissions(
+        can_send_messages=True,
+        can_send_audios=True,
+        can_send_documents=True,
+        can_send_photos=True,
+        can_send_videos=True,
+        can_send_video_notes=True,
+        can_send_voice_notes=True,
+        can_send_polls=True,
+        can_send_other_messages=True,
+        can_add_web_page_previews=True,
+        can_change_info=False,
+        can_invite_users=True,
+        can_pin_messages=False,
+        can_manage_topics=False,
+    )
+
+    for chat in chats:
+
+        chat_id = chat["_id"]
+
+        try:
+
+            if not await bot_is_admin(
+                context,
+                chat_id,
+            ):
+
+                skipped += 1
+                continue
+
+            await context.bot.restrict_chat_member(
+                chat_id=chat_id,
+                user_id=user_id,
+                permissions=normal_permissions,
+            )
+
+            unmuted += 1
+
+        except Forbidden:
+
+            skipped += 1
+
+        except TelegramError as e:
+
+            failed += 1
+
+            logger.warning(
+                "UNGMUTE FAILED | User=%s | Chat=%s | %s",
+                user_id,
+                chat_id,
+                e,
+            )
+
+        except Exception as e:
+
+            failed += 1
+
+            logger.exception(
+                "Unexpected UNGMUTE error: %s",
+                e,
+            )
+
+        await asyncio.sleep(0.15)
+
+    target_mention = get_user_mention(
+        user_id,
+        target_username,
+        target_first_name,
+    )
+
+    result = (
+        "🔊 <b>GLOBAL UNMUTE COMPLETED</b>\n\n"
+
+        f"👤 <b>Target:</b> {target_mention}\n"
+        f"🆔 <b>ID:</b> <code>{user_id}</code>\n\n"
+
+        f"📦 <b>Total:</b> {total}\n"
+        f"🔊 <b>Unmuted:</b> {unmuted}\n"
+        f"⏭ <b>Skipped:</b> {skipped}\n"
+        f"❌ <b>Failed:</b> {failed}"
+    )
+
+    await status_message.edit_text(
+        result,
+        parse_mode="HTML",
+    )
+
+    await send_action_log(
+        context=context,
+        action="UNGMUTE",
+        target_id=user_id,
+        target_username=target_username,
+        target_first_name=target_first_name,
+        admin=admin,
+        reason=reason,
+        total=total,
+        success=unmuted,
         skipped=skipped,
         failed=failed,
     )
@@ -910,14 +1455,14 @@ async def chats(
         1,
     ):
 
-        title = (
+        title = escape(
             chat.get("title")
             or "Unknown"
         )
 
         chat_id = chat["_id"]
 
-        chat_type = (
+        chat_type = escape(
             chat.get("type")
             or "unknown"
         )
@@ -947,7 +1492,7 @@ def main():
     )
 
     # -----------------------------------------------------
-    # COMMANDS
+    # START
     # -----------------------------------------------------
 
     app.add_handler(
@@ -957,12 +1502,20 @@ def main():
         )
     )
 
+    # -----------------------------------------------------
+    # GBAN
+    # -----------------------------------------------------
+
     app.add_handler(
         CommandHandler(
             "gban",
             gban,
         )
     )
+
+    # -----------------------------------------------------
+    # UNGBAN
+    # -----------------------------------------------------
 
     app.add_handler(
         CommandHandler(
@@ -971,13 +1524,45 @@ def main():
         )
     )
 
-    # Alias
     app.add_handler(
         CommandHandler(
             "unban",
             ungban,
         )
     )
+
+    # -----------------------------------------------------
+    # GMUTE
+    # -----------------------------------------------------
+
+    app.add_handler(
+        CommandHandler(
+            "gmute",
+            gmute,
+        )
+    )
+
+    # -----------------------------------------------------
+    # UNGMUTE
+    # -----------------------------------------------------
+
+    app.add_handler(
+        CommandHandler(
+            "ungmute",
+            ungmute,
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "unmute",
+            ungmute,
+        )
+    )
+
+    # -----------------------------------------------------
+    # CHATS
+    # -----------------------------------------------------
 
     app.add_handler(
         CommandHandler(
@@ -987,7 +1572,7 @@ def main():
     )
 
     # -----------------------------------------------------
-    # BOT ADMIN / CHAT REGISTRATION
+    # BOT MEMBERSHIP
     # -----------------------------------------------------
 
     app.add_handler(
@@ -996,6 +1581,10 @@ def main():
             ChatMemberHandler.MY_CHAT_MEMBER,
         )
     )
+
+    # -----------------------------------------------------
+    # LOG
+    # -----------------------------------------------------
 
     logger.info(
         "================================="
@@ -1006,12 +1595,20 @@ def main():
     )
 
     logger.info(
-        "Registered OWNER IDs: %s",
+        "GBAN + UNGBAN + GMUTE + UNGMUTE"
+    )
+
+    logger.info(
+        "Reply + Username + User ID + Mention"
+    )
+
+    logger.info(
+        "OWNER IDS: %s",
         list(OWNER_IDS),
     )
 
     logger.info(
-        "Logs Group: %s",
+        "LOGS GROUP: %s",
         LOGS_GROUP_ID,
     )
 
