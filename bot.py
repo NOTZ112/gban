@@ -1,20 +1,36 @@
 import os
 import asyncio
 import logging
+import re
 from datetime import datetime
 from html import escape
 
 from pymongo import MongoClient
 
-from telegram import Update, ChatPermissions
-from telegram.constants import ChatMemberStatus
-from telegram.error import TelegramError, Forbidden
+from telegram import (
+    Update,
+    ChatPermissions,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
+
+from telegram.constants import (
+    ChatMemberStatus,
+)
+
+from telegram.error import (
+    TelegramError,
+    Forbidden,
+)
 
 from telegram.ext import (
     Application,
     CommandHandler,
     ChatMemberHandler,
     ContextTypes,
+    MessageHandler,
+    CallbackQueryHandler,
+    filters,
 )
 
 
@@ -53,6 +69,20 @@ LOGS_GROUP_ID = int(LOGS_GROUP_ID)
 
 
 # =========================================================
+# SETTINGS
+# =========================================================
+
+ANTISPAM_ENABLED = True
+
+# 10 messages in 5 seconds
+ANTISPAM_LIMIT = 10
+ANTISPAM_WINDOW = 5
+
+# Maximum number of remembered timestamps per user
+ANTISPAM_MEMORY = 30
+
+
+# =========================================================
 # LOGGING
 # =========================================================
 
@@ -78,14 +108,45 @@ db = mongo["global_ban_bot"]
 chats_col = db["chats"]
 users_col = db["users"]
 
-# Permanent global actions
+# Existing
 global_bans_col = db["global_bans"]
 global_mutes_col = db["global_mutes"]
+
+# New
+admins_col = db["admins"]
+ban_words_col = db["ban_words"]
+logged_links_col = db["logged_links"]
+settings_col = db["settings"]
+
 
 users_col.create_index(
     "username",
     sparse=True,
 )
+
+ban_words_col.create_index(
+    "word",
+    unique=True,
+)
+
+logged_links_col.create_index(
+    "normalized_url",
+    unique=True,
+)
+
+admins_col.create_index(
+    "_id",
+    unique=True,
+)
+
+
+# =========================================================
+# GLOBAL IN-MEMORY DATA
+# =========================================================
+
+spam_tracker = {}
+
+ban_words_cache = set()
 
 
 # =========================================================
@@ -96,7 +157,22 @@ def is_owner(user_id: int) -> bool:
     return user_id in OWNER_IDS
 
 
+def is_admin(user_id: int) -> bool:
+
+    if is_owner(user_id):
+        return True
+
+    return (
+        admins_col.find_one(
+            {"_id": user_id},
+            {"_id": 1},
+        )
+        is not None
+    )
+
+
 def save_user(user):
+
     if not user:
         return
 
@@ -121,6 +197,7 @@ def save_user(user):
 
 
 def save_chat(chat):
+
     if not chat:
         return
 
@@ -139,34 +216,24 @@ def save_chat(chat):
 
 
 def remove_chat(chat_id):
+
     chats_col.delete_one(
         {"_id": chat_id}
     )
 
 
 def resolve_user(value: str):
-    """
-    Supports:
-
-    123456789
-    @username
-    username
-
-    Username must have been seen by the bot previously.
-    """
 
     if not value:
         return None
 
     value = value.strip()
 
-    # User ID
     try:
         return int(value)
     except ValueError:
         pass
 
-    # Username
     username = value.lstrip("@").lower()
 
     user = users_col.find_one(
@@ -214,6 +281,7 @@ def get_user_mention(
 
 
 def current_time():
+
     return datetime.now().strftime(
         "%d %b %Y • %H:%M:%S"
     )
@@ -254,7 +322,6 @@ def get_target_from_command(
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    # First try argument
     if context.args:
 
         user_id = resolve_user(
@@ -264,7 +331,6 @@ def get_target_from_command(
         if user_id is not None:
             return user_id
 
-    # Then reply
     reply_user = get_reply_user(update)
 
     if reply_user:
@@ -283,14 +349,12 @@ def get_reason(
 
     first = context.args[0]
 
-    # Target + reason
     if resolve_user(first) is not None:
 
         return " ".join(
             context.args[1:]
         ).strip()
 
-    # Reply + reason
     if get_reply_user(update):
 
         return " ".join(
@@ -331,7 +395,7 @@ def get_target_info(
 
 
 # =========================================================
-# GLOBAL DATABASE
+# GLOBAL BAN
 # =========================================================
 
 def add_global_ban(
@@ -375,6 +439,10 @@ def is_global_banned(user_id: int) -> bool:
     )
 
 
+# =========================================================
+# GLOBAL MUTE
+# =========================================================
+
 def add_global_mute(
     user_id: int,
     username: str = "",
@@ -417,7 +485,7 @@ def is_global_muted(user_id: int) -> bool:
 
 
 # =========================================================
-# LOGGING
+# ACTION LOG
 # =========================================================
 
 async def send_action_log(
@@ -505,7 +573,607 @@ async def send_action_log(
 
 
 # =========================================================
-# BOT MEMBERSHIP
+# BAN WORD SYSTEM
+# =========================================================
+
+def normalize_ban_word(text: str):
+
+    if not text:
+        return ""
+
+    text = text.lower().strip()
+
+    # Collapse spaces
+    text = re.sub(
+        r"\s+",
+        " ",
+        text,
+    )
+
+    return text
+
+
+def load_ban_words():
+
+    global ban_words_cache
+
+    ban_words_cache = {
+        normalize_ban_word(
+            doc.get("word", "")
+        )
+        for doc in ban_words_col.find({})
+        if doc.get("word")
+    }
+
+    ban_words_cache.discard("")
+
+    logger.info(
+        "BAN WORDS LOADED: %s",
+        len(ban_words_cache),
+    )
+
+
+def add_ban_word(word: str, admin_id: int):
+
+    normalized = normalize_ban_word(word)
+
+    if not normalized:
+        return False
+
+    result = ban_words_col.update_one(
+        {"word": normalized},
+        {
+            "$set": {
+                "word": normalized,
+                "added_by": admin_id,
+                "created_at": datetime.utcnow(),
+            }
+        },
+        upsert=True,
+    )
+
+    ban_words_cache.add(normalized)
+
+    return True
+
+
+def remove_ban_word(word: str):
+
+    normalized = normalize_ban_word(word)
+
+    result = ban_words_col.delete_one(
+        {"word": normalized}
+    )
+
+    ban_words_cache.discard(normalized)
+
+    return result.deleted_count > 0
+
+
+def message_has_ban_word(text: str):
+
+    if not text or not ban_words_cache:
+        return False
+
+    normalized_text = text.lower()
+
+    for word in ban_words_cache:
+
+        # Word boundary for normal words
+        pattern = (
+            r"(?<!\w)"
+            + re.escape(word)
+            + r"(?!\w)"
+        )
+
+        if re.search(
+            pattern,
+            normalized_text,
+            re.IGNORECASE,
+        ):
+            return True
+
+    return False
+
+
+# =========================================================
+# LINK DETECTION
+# =========================================================
+
+URL_PATTERN = re.compile(
+    r"(?i)\b("
+    r"(?:https?://|www\.)"
+    r"[^\s<>()]+"
+    r"|"
+    r"(?:t\.me|telegram\.me|telegram\.dog)"
+    r"/[^\s<>()]+"
+    r")"
+)
+
+
+# Generic domain pattern
+DOMAIN_PATTERN = re.compile(
+    r"(?i)\b"
+    r"(?:[a-z0-9-]+\.)+"
+    r"[a-z]{2,}"
+    r"(?:/[^\s<>()]*)?"
+)
+
+
+EMAIL_PATTERN = re.compile(
+    r"(?i)\b"
+    r"[a-z0-9._%+-]+"
+    r"@"
+    r"[a-z0-9.-]+\."
+    r"[a-z]{2,}"
+    r"\b"
+)
+
+
+PHONE_PATTERN = re.compile(
+    r"(?<!\w)"
+    r"(?:\+?\d[\d\s().-]{7,}\d)"
+    r"(?!\w)"
+)
+
+
+TELEGRAM_INVITE_PATTERN = re.compile(
+    r"(?i)"
+    r"(?:https?://)?"
+    r"(?:www\.)?"
+    r"(?:t\.me|telegram\.me)"
+    r"/"
+    r"(?:\+|joinchat/)"
+    r"[A-Za-z0-9_-]+"
+)
+
+
+def extract_links(text: str):
+
+    if not text:
+        return []
+
+    found = []
+
+    for match in URL_PATTERN.findall(text):
+        found.append(match)
+
+    for match in DOMAIN_PATTERN.findall(text):
+        if match not in found:
+            found.append(match)
+
+    return found
+
+
+def normalize_url(url: str):
+
+    if not url:
+        return ""
+
+    url = url.strip()
+
+    # Remove common punctuation from sentence ending
+    url = url.rstrip(
+        ".,!?;:)]}>\"'"
+    )
+
+    url = url.lower()
+
+    # Add scheme for normalization
+    if url.startswith("www."):
+        url = "https://" + url
+
+    elif not re.match(
+        r"^[a-z]+://",
+        url,
+        re.IGNORECASE,
+    ):
+        if re.match(
+            r"^(t\.me|telegram\.me|telegram\.dog)/",
+            url,
+            re.IGNORECASE,
+        ):
+            url = "https://" + url
+
+    # Remove trailing slash
+    url = url.rstrip("/")
+
+    return url
+
+
+def contains_link(text: str):
+
+    return bool(
+        extract_links(text)
+    )
+
+
+def contains_email(text: str):
+
+    if not text:
+        return False
+
+    return bool(
+        EMAIL_PATTERN.search(text)
+    )
+
+
+def contains_phone(text: str):
+
+    if not text:
+        return False
+
+    return bool(
+        PHONE_PATTERN.search(text)
+    )
+
+
+def contains_telegram_invite(text: str):
+
+    if not text:
+        return False
+
+    return bool(
+        TELEGRAM_INVITE_PATTERN.search(text)
+    )
+
+
+# =========================================================
+# LINK LOG
+# =========================================================
+
+async def log_deleted_link(
+    context,
+    link: str,
+    user,
+    chat,
+):
+
+    normalized = normalize_url(link)
+
+    if not normalized:
+        return
+
+    # Atomic duplicate protection
+    try:
+
+        result = logged_links_col.update_one(
+            {
+                "normalized_url": normalized
+            },
+            {
+                "$setOnInsert": {
+                    "normalized_url": normalized,
+                    "original_url": link,
+                    "first_user_id": user.id,
+                    "first_username": user.username or "",
+                    "first_name": user.full_name or "",
+                    "first_chat_id": chat.id,
+                    "first_chat_title": chat.title or "",
+                    "created_at": datetime.utcnow(),
+                }
+            },
+            upsert=True,
+        )
+
+        # Already existed
+        if result.matched_count > 0:
+            return
+
+    except Exception as e:
+
+        # Duplicate key means already logged
+        if "duplicate" in str(e).lower():
+            return
+
+        logger.warning(
+            "LINK LOG DB ERROR: %s",
+            e,
+        )
+        return
+
+    user_display = (
+        f"@{escape(user.username)}"
+        if user.username
+        else escape(user.full_name or "User")
+    )
+
+    chat_title = escape(
+        chat.title or "Unknown Group"
+    )
+
+    text = (
+        "🔗 <b>LINK DETECTED</b>\n\n"
+
+        f"🔗 <b>Link:</b>\n"
+        f"<code>{escape(link)}</code>\n\n"
+
+        f"👤 <b>User:</b> {user_display}\n"
+        f"🆔 <b>User ID:</b> "
+        f"<code>{user.id}</code>\n\n"
+
+        f"👥 <b>Group:</b> {chat_title}\n"
+        f"🆔 <b>Group ID:</b> "
+        f"<code>{chat.id}</code>\n\n"
+
+        f"🕐 <b>Time:</b> {current_time()}"
+    )
+
+    try:
+
+        await context.bot.send_message(
+            chat_id=LOGS_GROUP_ID,
+            text=text,
+            parse_mode="HTML",
+        )
+
+    except TelegramError as e:
+
+        logger.warning(
+            "LINK LOG SEND FAILED: %s",
+            e,
+        )
+
+
+# =========================================================
+# ANTI SPAM
+# =========================================================
+
+def check_antispam(
+    chat_id: int,
+    user_id: int,
+):
+
+    if not ANTISPAM_ENABLED:
+        return False
+
+    now = datetime.utcnow().timestamp()
+
+    key = (
+        chat_id,
+        user_id,
+    )
+
+    timestamps = spam_tracker.get(
+        key,
+        [],
+    )
+
+    # Keep only recent messages
+    timestamps = [
+        t
+        for t in timestamps
+        if now - t <= ANTISPAM_WINDOW
+    ]
+
+    timestamps.append(now)
+
+    # Prevent unlimited memory
+    timestamps = timestamps[
+        -ANTISPAM_MEMORY:
+    ]
+
+    spam_tracker[key] = timestamps
+
+    return len(timestamps) > ANTISPAM_LIMIT
+
+
+def clear_spam_tracker(
+    chat_id,
+    user_id,
+):
+
+    spam_tracker.pop(
+        (chat_id, user_id),
+        None,
+    )
+
+
+# =========================================================
+# MODERATION MESSAGE HANDLER
+# =========================================================
+
+async def moderation_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    message = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+
+    if not message or not chat or not user:
+        return
+
+    # Only groups/supergroups
+    if chat.type not in (
+        "group",
+        "supergroup",
+    ):
+        return
+
+    if user.is_bot:
+        return
+
+    save_user(user)
+    save_chat(chat)
+
+    # -----------------------------------------------------
+    # OWNER / BOT ADMINS PROTECTED
+    # -----------------------------------------------------
+
+    if is_owner(user.id):
+        return
+
+    # If user is Telegram group admin, don't filter
+    try:
+
+        member = await context.bot.get_chat_member(
+            chat.id,
+            user.id,
+        )
+
+        if member.status in (
+            ChatMemberStatus.ADMINISTRATOR,
+            ChatMemberStatus.OWNER,
+        ):
+            return
+
+    except TelegramError:
+        pass
+
+    # -----------------------------------------------------
+    # MESSAGE TEXT + CAPTION
+    # -----------------------------------------------------
+
+    text = (
+        message.text
+        or message.caption
+        or ""
+    )
+
+    # -----------------------------------------------------
+    # ANTI SPAM
+    # -----------------------------------------------------
+
+    if check_antispam(
+        chat.id,
+        user.id,
+    ):
+
+        try:
+
+            await message.delete()
+
+        except TelegramError as e:
+
+            logger.debug(
+                "SPAM DELETE FAILED | %s",
+                e,
+            )
+
+        return
+
+    # -----------------------------------------------------
+    # BAN WORD
+    # -----------------------------------------------------
+
+    if message_has_ban_word(text):
+
+        try:
+
+            await message.delete()
+
+        except TelegramError as e:
+
+            logger.debug(
+                "BAN WORD DELETE FAILED | %s",
+                e,
+            )
+
+        return
+
+    # -----------------------------------------------------
+    # EMAIL
+    # -----------------------------------------------------
+
+    if contains_email(text):
+
+        try:
+
+            await message.delete()
+
+        except TelegramError as e:
+
+            logger.debug(
+                "EMAIL DELETE FAILED | %s",
+                e,
+            )
+
+        return
+
+    # -----------------------------------------------------
+    # PHONE
+    # -----------------------------------------------------
+
+    if contains_phone(text):
+
+        try:
+
+            await message.delete()
+
+        except TelegramError as e:
+
+            logger.debug(
+                "PHONE DELETE FAILED | %s",
+                e,
+            )
+
+        return
+
+    # -----------------------------------------------------
+    # TELEGRAM INVITE LINK
+    # -----------------------------------------------------
+
+    if contains_telegram_invite(text):
+
+        links = extract_links(text)
+
+        for link in links:
+
+            await log_deleted_link(
+                context,
+                link,
+                user,
+                chat,
+            )
+
+        try:
+
+            await message.delete()
+
+        except TelegramError as e:
+
+            logger.debug(
+                "TELEGRAM INVITE DELETE FAILED | %s",
+                e,
+            )
+
+        return
+
+    # -----------------------------------------------------
+    # ALL OTHER LINKS
+    # -----------------------------------------------------
+
+    if contains_link(text):
+
+        links = extract_links(text)
+
+        for link in links:
+
+            await log_deleted_link(
+                context,
+                link,
+                user,
+                chat,
+            )
+
+        try:
+
+            await message.delete()
+
+        except TelegramError as e:
+
+            logger.debug(
+                "LINK DELETE FAILED | %s",
+                e,
+            )
+
+        return
+
+
+# =========================================================
+# BOT MEMBERSHIP UPDATE
 # =========================================================
 
 async def bot_membership_update(
@@ -525,7 +1193,6 @@ async def bot_membership_update(
 
     new_status = event.new_chat_member.status
 
-    # Bot became admin
     if new_status in (
         ChatMemberStatus.ADMINISTRATOR,
         ChatMemberStatus.OWNER,
@@ -539,13 +1206,6 @@ async def bot_membership_update(
             chat.title,
         )
 
-        # -------------------------------------------------
-        # When bot becomes admin in a new chat,
-        # automatically apply existing global bans/mutes
-        # to users only when Telegram gives us member updates.
-        # -------------------------------------------------
-
-    # Bot left
     elif new_status in (
         ChatMemberStatus.LEFT,
         ChatMemberStatus.BANNED,
@@ -586,18 +1246,12 @@ async def user_membership_update(
     if not user:
         return
 
-    # Save every user we see
     save_user(user)
 
-    # Ignore bots
     if user.is_bot:
         return
 
     new_status = member.status
-
-    # -----------------------------------------------------
-    # USER JOINED / BECAME MEMBER
-    # -----------------------------------------------------
 
     if new_status in (
         ChatMemberStatus.MEMBER,
@@ -723,6 +1377,9 @@ async def start(
             update.effective_user
         )
 
+    if not update.message:
+        return
+
     text = (
         "🛡️ <b>GLOBAL BAN BOT</b>\n\n"
 
@@ -752,6 +1409,880 @@ async def start(
 
 
 # =========================================================
+# ADMIN PANEL
+# =========================================================
+
+def admin_panel_keyboard():
+
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "🚫 Ban Words",
+                    callback_data="panel_banwords",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "🔗 Link Filter",
+                    callback_data="panel_links",
+                ),
+                InlineKeyboardButton(
+                    "⚡ Anti-Spam",
+                    callback_data="panel_spam",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "👑 Admin Management",
+                    callback_data="panel_admins",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "📊 Statistics",
+                    callback_data="panel_stats",
+                ),
+            ],
+        ]
+    )
+
+
+async def panel(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    user = update.effective_user
+
+    if not user:
+        return
+
+    if not is_admin(user.id):
+
+        await update.message.reply_text(
+            "❌ You are not authorized."
+        )
+        return
+
+    save_user(user)
+
+    await update.message.reply_text(
+        "🛡️ <b>GBAN ADMIN PANEL</b>\n\n"
+        "Select an option:",
+        parse_mode="HTML",
+        reply_markup=admin_panel_keyboard(),
+    )
+
+
+# =========================================================
+# CALLBACK QUERY
+# =========================================================
+
+async def panel_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    query = update.callback_query
+
+    if not query:
+        return
+
+    await query.answer()
+
+    user = query.from_user
+
+    if not is_admin(user.id):
+
+        await query.answer(
+            "❌ Not authorized.",
+            show_alert=True,
+        )
+        return
+
+    data = query.data
+
+    # -----------------------------------------------------
+    # MAIN PANEL
+    # -----------------------------------------------------
+
+    if data == "panel_home":
+
+        await query.edit_message_text(
+            "🛡️ <b>GBAN ADMIN PANEL</b>\n\n"
+            "Select an option:",
+            parse_mode="HTML",
+            reply_markup=admin_panel_keyboard(),
+        )
+
+        return
+
+    # -----------------------------------------------------
+    # BAN WORD PANEL
+    # -----------------------------------------------------
+
+    if data == "panel_banwords":
+
+        count = ban_words_col.count_documents({})
+
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "➕ Add Ban Word",
+                        callback_data="banword_add",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🗑️ Remove Ban Word",
+                        callback_data="banword_remove",
+                    ),
+                    InlineKeyboardButton(
+                        "📋 Word List",
+                        callback_data="banword_list",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🔙 Back",
+                        callback_data="panel_home",
+                    ),
+                ],
+            ]
+        )
+
+        await query.edit_message_text(
+            "🚫 <b>GLOBAL BAN WORDS</b>\n\n"
+            f"📊 Total Words: <b>{count}</b>\n\n"
+            "Words added here are automatically active "
+            "in all registered groups.",
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+
+        return
+
+    # -----------------------------------------------------
+    # ADD BAN WORD
+    # -----------------------------------------------------
+
+    if data == "banword_add":
+
+        context.user_data["panel_action"] = "add_banword"
+
+        await query.edit_message_text(
+            "➕ <b>ADD GLOBAL BAN WORD</b>\n\n"
+            "Send the word now.\n\n"
+            "It will automatically apply to "
+            "<b>all current and future groups</b>.\n\n"
+            "Send /cancel to cancel.",
+            parse_mode="HTML",
+        )
+
+        return
+
+    # -----------------------------------------------------
+    # REMOVE BAN WORD
+    # -----------------------------------------------------
+
+    if data == "banword_remove":
+
+        context.user_data["panel_action"] = "remove_banword"
+
+        await query.edit_message_text(
+            "🗑️ <b>REMOVE GLOBAL BAN WORD</b>\n\n"
+            "Send the word you want to remove.\n\n"
+            "Send /cancel to cancel.",
+            parse_mode="HTML",
+        )
+
+        return
+
+    # -----------------------------------------------------
+    # LIST BAN WORDS
+    # -----------------------------------------------------
+
+    if data == "banword_list":
+
+        words = list(
+            ban_words_col.find(
+                {},
+                {"word": 1},
+            ).sort(
+                "word",
+                1,
+            )
+        )
+
+        if not words:
+
+            text = (
+                "📋 <b>BAN WORD LIST</b>\n\n"
+                "No ban words added."
+            )
+
+        else:
+
+            lines = []
+
+            for i, doc in enumerate(
+                words,
+                1,
+            ):
+
+                lines.append(
+                    f"{i}. <code>"
+                    f"{escape(doc['word'])}"
+                    f"</code>"
+                )
+
+            text = (
+                "📋 <b>GLOBAL BAN WORDS</b>\n\n"
+                + "\n".join(lines)
+            )
+
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "🔙 Back",
+                        callback_data="panel_banwords",
+                    )
+                ]
+            ]
+        )
+
+        await query.edit_message_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+
+        return
+
+    # -----------------------------------------------------
+    # LINK PANEL
+    # -----------------------------------------------------
+
+    if data == "panel_links":
+
+        count = logged_links_col.count_documents({})
+
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "📊 Logged Links",
+                        callback_data="link_count",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🔙 Back",
+                        callback_data="panel_home",
+                    )
+                ],
+            ]
+        )
+
+        await query.edit_message_text(
+            "🔗 <b>GLOBAL LINK FILTER</b>\n\n"
+            "Status: <b>ACTIVE</b> 🟢\n\n"
+            "• All links → delete\n"
+            "• Telegram links → delete\n"
+            "• Invite links → delete\n"
+            "• Email → delete\n"
+            "• Phone numbers → delete\n\n"
+            "🔇 Silent moderation\n"
+            "📥 Deleted links are logged\n"
+            "♻️ Duplicate links are never logged twice.\n\n"
+            f"📊 Unique logged links: <b>{count}</b>",
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+
+        return
+
+    # -----------------------------------------------------
+    # LINK COUNT
+    # -----------------------------------------------------
+
+    if data == "link_count":
+
+        count = logged_links_col.count_documents({})
+
+        await query.answer(
+            f"Unique logged links: {count}",
+            show_alert=True,
+        )
+
+        return
+
+    # -----------------------------------------------------
+    # ANTISPAM
+    # -----------------------------------------------------
+
+    if data == "panel_spam":
+
+        status = (
+            "🟢 ON"
+            if ANTISPAM_ENABLED
+            else "🔴 OFF"
+        )
+
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "🟢 Enable",
+                        callback_data="spam_on",
+                    ),
+                    InlineKeyboardButton(
+                        "🔴 Disable",
+                        callback_data="spam_off",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🔙 Back",
+                        callback_data="panel_home",
+                    )
+                ],
+            ]
+        )
+
+        await query.edit_message_text(
+            "⚡ <b>ANTI-SPAM</b>\n\n"
+            f"Status: <b>{status}</b>\n\n"
+            f"Limit: <b>{ANTISPAM_LIMIT}</b> messages\n"
+            f"Window: <b>{ANTISPAM_WINDOW}</b> seconds\n\n"
+            "Spam messages are silently deleted.",
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+
+        return
+
+    # -----------------------------------------------------
+    # SPAM ON
+    # -----------------------------------------------------
+
+    if data == "spam_on":
+
+        global ANTISPAM_ENABLED
+
+        ANTISPAM_ENABLED = True
+
+        settings_col.update_one(
+            {"_id": "antispam"},
+            {
+                "$set": {
+                    "enabled": True
+                }
+            },
+            upsert=True,
+        )
+
+        await query.edit_message_text(
+            "⚡ <b>ANTI-SPAM ENABLED</b>\n\n"
+            f"Limit: {ANTISPAM_LIMIT} messages / "
+            f"{ANTISPAM_WINDOW} seconds.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "🔙 Back",
+                            callback_data="panel_spam",
+                        )
+                    ]
+                ]
+            ),
+        )
+
+        return
+
+    # -----------------------------------------------------
+    # SPAM OFF
+    # -----------------------------------------------------
+
+    if data == "spam_off":
+
+        ANTISPAM_ENABLED = False
+
+        settings_col.update_one(
+            {"_id": "antispam"},
+            {
+                "$set": {
+                    "enabled": False
+                }
+            },
+            upsert=True,
+        )
+
+        await query.edit_message_text(
+            "⚡ <b>ANTI-SPAM DISABLED</b>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "🔙 Back",
+                            callback_data="panel_spam",
+                        )
+                    ]
+                ]
+            ),
+        )
+
+        return
+
+    # -----------------------------------------------------
+    # ADMIN MANAGEMENT
+    # -----------------------------------------------------
+
+    if data == "panel_admins":
+
+        if not is_owner(user.id):
+
+            await query.answer(
+                "Only Owner can manage admins.",
+                show_alert=True,
+            )
+            return
+
+        count = admins_col.count_documents({})
+
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "➕ Add Admin",
+                        callback_data="admin_add",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "➖ Remove Admin",
+                        callback_data="admin_remove",
+                    ),
+                    InlineKeyboardButton(
+                        "👥 Admin List",
+                        callback_data="admin_list",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🔙 Back",
+                        callback_data="panel_home",
+                    )
+                ],
+            ]
+        )
+
+        await query.edit_message_text(
+            "👑 <b>ADMIN MANAGEMENT</b>\n\n"
+            f"Current additional admins: <b>{count}</b>\n\n"
+            "Only Owner can add/remove admins.",
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+
+        return
+
+    # -----------------------------------------------------
+    # ADD ADMIN
+    # -----------------------------------------------------
+
+    if data == "admin_add":
+
+        if not is_owner(user.id):
+            return
+
+        context.user_data["panel_action"] = "add_admin"
+
+        await query.edit_message_text(
+            "➕ <b>ADD ADMIN</b>\n\n"
+            "Send the Telegram User ID.\n\n"
+            "Example:\n"
+            "<code>123456789</code>\n\n"
+            "Send /cancel to cancel.",
+            parse_mode="HTML",
+        )
+
+        return
+
+    # -----------------------------------------------------
+    # REMOVE ADMIN
+    # -----------------------------------------------------
+
+    if data == "admin_remove":
+
+        if not is_owner(user.id):
+            return
+
+        context.user_data["panel_action"] = "remove_admin"
+
+        await query.edit_message_text(
+            "➖ <b>REMOVE ADMIN</b>\n\n"
+            "Send the Telegram User ID.\n\n"
+            "Send /cancel to cancel.",
+            parse_mode="HTML",
+        )
+
+        return
+
+    # -----------------------------------------------------
+    # ADMIN LIST
+    # -----------------------------------------------------
+
+    if data == "admin_list":
+
+        if not is_owner(user.id):
+            return
+
+        admins = list(
+            admins_col.find({})
+        )
+
+        if not admins:
+
+            text = (
+                "👥 <b>ADMIN LIST</b>\n\n"
+                "No additional admins."
+            )
+
+        else:
+
+            lines = []
+
+            for i, doc in enumerate(
+                admins,
+                1,
+            ):
+
+                admin_id = doc["_id"]
+
+                user_data = users_col.find_one(
+                    {"_id": admin_id}
+                )
+
+                if user_data:
+
+                    name = (
+                        user_data.get("first_name")
+                        or "Admin"
+                    )
+
+                    username = (
+                        user_data.get("username")
+                        or ""
+                    )
+
+                    if username:
+                        display = (
+                            f"@{escape(username)}"
+                        )
+                    else:
+                        display = escape(name)
+
+                else:
+
+                    display = "Admin"
+
+                lines.append(
+                    f"{i}. {display}\n"
+                    f"🆔 <code>{admin_id}</code>"
+                )
+
+            text = (
+                "👥 <b>ADMIN LIST</b>\n\n"
+                + "\n\n".join(lines)
+            )
+
+        await query.edit_message_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "🔙 Back",
+                            callback_data="panel_admins",
+                        )
+                    ]
+                ]
+            ),
+        )
+
+        return
+
+    # -----------------------------------------------------
+    # STATISTICS
+    # -----------------------------------------------------
+
+    if data == "panel_stats":
+
+        chats_count = chats_col.count_documents({})
+        users_count = users_col.count_documents({})
+        bans_count = global_bans_col.count_documents({})
+        mutes_count = global_mutes_col.count_documents({})
+        words_count = ban_words_col.count_documents({})
+        links_count = logged_links_col.count_documents({})
+
+        await query.edit_message_text(
+            "📊 <b>GBAN BOT STATISTICS</b>\n\n"
+
+            f"👥 Users: <b>{users_count}</b>\n"
+            f"💬 Registered Groups: <b>{chats_count}</b>\n"
+            f"🔨 Global Bans: <b>{bans_count}</b>\n"
+            f"🔇 Global Mutes: <b>{mutes_count}</b>\n"
+            f"🚫 Ban Words: <b>{words_count}</b>\n"
+            f"🔗 Unique Logged Links: <b>{links_count}</b>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "🔙 Back",
+                            callback_data="panel_home",
+                        )
+                    ]
+                ]
+            ),
+        )
+
+        return
+
+
+# =========================================================
+# PANEL TEXT INPUT
+# =========================================================
+
+async def panel_text_input(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    user = update.effective_user
+    message = update.effective_message
+
+    if not user or not message:
+        return
+
+    action = context.user_data.get(
+        "panel_action"
+    )
+
+    if not action:
+        return
+
+    if not is_admin(user.id):
+        context.user_data.pop(
+            "panel_action",
+            None,
+        )
+        return
+
+    text = (
+        message.text
+        or ""
+    ).strip()
+
+    if not text:
+        return
+
+    # -----------------------------------------------------
+    # ADD BAN WORD
+    # -----------------------------------------------------
+
+    if action == "add_banword":
+
+        context.user_data.pop(
+            "panel_action",
+            None,
+        )
+
+        if add_ban_word(
+            text,
+            user.id,
+        ):
+
+            await message.reply_text(
+                "✅ <b>Ban Word Added</b>\n\n"
+                f"🚫 Word: <code>{escape(text)}</code>\n\n"
+                "🌍 It is now active in "
+                "<b>all current and future registered groups</b>.\n\n"
+                "🗑️ Matching messages will be "
+                "silently deleted.",
+                parse_mode="HTML",
+            )
+
+        return
+
+    # -----------------------------------------------------
+    # REMOVE BAN WORD
+    # -----------------------------------------------------
+
+    if action == "remove_banword":
+
+        context.user_data.pop(
+            "panel_action",
+            None,
+        )
+
+        if remove_ban_word(text):
+
+            await message.reply_text(
+                "✅ <b>Ban Word Removed</b>\n\n"
+                f"🚫 Word: <code>{escape(text)}</code>",
+                parse_mode="HTML",
+            )
+
+        else:
+
+            await message.reply_text(
+                "❌ Ban Word not found."
+            )
+
+        return
+
+    # -----------------------------------------------------
+    # ADD ADMIN
+    # -----------------------------------------------------
+
+    if action == "add_admin":
+
+        context.user_data.pop(
+            "panel_action",
+            None,
+        )
+
+        if not is_owner(user.id):
+
+            await message.reply_text(
+                "❌ Owner only."
+            )
+            return
+
+        try:
+
+            admin_id = int(text)
+
+        except ValueError:
+
+            await message.reply_text(
+                "❌ Invalid User ID."
+            )
+            return
+
+        if is_owner(admin_id):
+
+            await message.reply_text(
+                "ℹ️ This user is already an Owner."
+            )
+            return
+
+        admins_col.update_one(
+            {"_id": admin_id},
+            {
+                "$set": {
+                    "added_by": user.id,
+                    "created_at": datetime.utcnow(),
+                }
+            },
+            upsert=True,
+        )
+
+        await message.reply_text(
+            "✅ <b>Admin Added</b>\n\n"
+            f"🆔 User ID: <code>{admin_id}</code>",
+            parse_mode="HTML",
+        )
+
+        return
+
+    # -----------------------------------------------------
+    # REMOVE ADMIN
+    # -----------------------------------------------------
+
+    if action == "remove_admin":
+
+        context.user_data.pop(
+            "panel_action",
+            None,
+        )
+
+        if not is_owner(user.id):
+
+            await message.reply_text(
+                "❌ Owner only."
+            )
+            return
+
+        try:
+
+            admin_id = int(text)
+
+        except ValueError:
+
+            await message.reply_text(
+                "❌ Invalid User ID."
+            )
+            return
+
+        if is_owner(admin_id):
+
+            await message.reply_text(
+                "❌ Owner cannot be removed."
+            )
+            return
+
+        result = admins_col.delete_one(
+            {"_id": admin_id}
+        )
+
+        if result.deleted_count:
+
+            await message.reply_text(
+                "✅ <b>Admin Removed</b>\n\n"
+                f"🆔 User ID: <code>{admin_id}</code>",
+                parse_mode="HTML",
+            )
+
+        else:
+
+            await message.reply_text(
+                "❌ Admin not found."
+            )
+
+        return
+
+
+# =========================================================
+# CANCEL
+# =========================================================
+
+async def cancel(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    context.user_data.pop(
+        "panel_action",
+        None,
+    )
+
+    if update.message:
+
+        await update.message.reply_text(
+            "❌ Cancelled."
+        )
+
+
+# =========================================================
 # GLOBAL BAN
 # =========================================================
 
@@ -765,7 +2296,7 @@ async def gban(
     if not admin:
         return
 
-    if not is_owner(admin.id):
+    if not is_admin(admin.id):
 
         await update.message.reply_text(
             "❌ You are not authorized."
@@ -801,6 +2332,14 @@ async def gban(
 
         return
 
+    # Prevent admin/owner GBAN accidentally
+    if is_owner(user_id):
+
+        await update.message.reply_text(
+            "❌ Owner cannot be globally banned."
+        )
+        return
+
     reason = get_reason(
         update,
         context,
@@ -810,10 +2349,6 @@ async def gban(
         user_id,
         update,
     )
-
-    # =====================================================
-    # SAVE PERMANENT GLOBAL BAN
-    # =====================================================
 
     add_global_ban(
         user_id=user_id,
@@ -958,7 +2493,7 @@ async def ungban(
     if not admin:
         return
 
-    if not is_owner(admin.id):
+    if not is_admin(admin.id):
 
         await update.message.reply_text(
             "❌ You are not authorized."
@@ -1001,7 +2536,6 @@ async def ungban(
         update,
     )
 
-    # Remove permanent ban
     remove_global_ban(user_id)
 
     chats = list(
@@ -1135,7 +2669,7 @@ async def gmute(
     if not admin:
         return
 
-    if not is_owner(admin.id):
+    if not is_admin(admin.id):
 
         await update.message.reply_text(
             "❌ You are not authorized."
@@ -1169,6 +2703,13 @@ async def gmute(
 
         return
 
+    if is_owner(user_id):
+
+        await update.message.reply_text(
+            "❌ Owner cannot be globally muted."
+        )
+        return
+
     reason = get_reason(
         update,
         context,
@@ -1178,10 +2719,6 @@ async def gmute(
         user_id,
         update,
     )
-
-    # =====================================================
-    # SAVE PERMANENT GLOBAL MUTE
-    # =====================================================
 
     add_global_mute(
         user_id=user_id,
@@ -1341,7 +2878,7 @@ async def ungmute(
     if not admin:
         return
 
-    if not is_owner(admin.id):
+    if not is_admin(admin.id):
 
         await update.message.reply_text(
             "❌ You are not authorized."
@@ -1384,7 +2921,6 @@ async def ungmute(
         update,
     )
 
-    # Remove permanent mute
     remove_global_mute(user_id)
 
     chats = list(
@@ -1535,7 +3071,7 @@ async def chats(
     if not admin:
         return
 
-    if not is_owner(admin.id):
+    if not is_admin(admin.id):
 
         await update.message.reply_text(
             "❌ You are not authorized."
@@ -1586,10 +3122,34 @@ async def chats(
 
 
 # =========================================================
+# LOAD SETTINGS
+# =========================================================
+
+def load_settings():
+
+    global ANTISPAM_ENABLED
+
+    data = settings_col.find_one(
+        {"_id": "antispam"}
+    )
+
+    if data is not None:
+        ANTISPAM_ENABLED = bool(
+            data.get(
+                "enabled",
+                True,
+            )
+        )
+
+
+# =========================================================
 # MAIN
 # =========================================================
 
 def main():
+
+    load_ban_words()
+    load_settings()
 
     app = (
         Application.builder()
@@ -1602,35 +3162,118 @@ def main():
     # -----------------------------------------------------
 
     app.add_handler(
-        CommandHandler("start", start)
+        CommandHandler(
+            "start",
+            start,
+        )
     )
 
     app.add_handler(
-        CommandHandler("gban", gban)
+        CommandHandler(
+            "panel",
+            panel,
+        )
     )
 
     app.add_handler(
-        CommandHandler("ungban", ungban)
+        CommandHandler(
+            "admin",
+            panel,
+        )
     )
 
     app.add_handler(
-        CommandHandler("unban", ungban)
+        CommandHandler(
+            "cancel",
+            cancel,
+        )
     )
 
     app.add_handler(
-        CommandHandler("gmute", gmute)
+        CommandHandler(
+            "gban",
+            gban,
+        )
     )
 
     app.add_handler(
-        CommandHandler("ungmute", ungmute)
+        CommandHandler(
+            "ungban",
+            ungban,
+        )
     )
 
     app.add_handler(
-        CommandHandler("unmute", ungmute)
+        CommandHandler(
+            "unban",
+            ungban,
+        )
     )
 
     app.add_handler(
-        CommandHandler("chats", chats)
+        CommandHandler(
+            "gmute",
+            gmute,
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "ungmute",
+            ungmute,
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "unmute",
+            ungmute,
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "chats",
+            chats,
+        )
+    )
+
+    # -----------------------------------------------------
+    # PANEL CALLBACKS
+    # -----------------------------------------------------
+
+    app.add_handler(
+        CallbackQueryHandler(
+            panel_callback,
+        )
+    )
+
+    # -----------------------------------------------------
+    # PANEL TEXT INPUT
+    # IMPORTANT:
+    # This is before moderation handler.
+    # -----------------------------------------------------
+
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT
+            & ~filters.COMMAND
+            & filters.ChatType.PRIVATE,
+            panel_text_input,
+        ),
+        group=0,
+    )
+
+    # -----------------------------------------------------
+    # GROUP MODERATION
+    # -----------------------------------------------------
+
+    app.add_handler(
+        MessageHandler(
+            filters.ChatType.GROUPS,
+            moderation_message,
+        ),
+        group=1,
     )
 
     # -----------------------------------------------------
@@ -1676,7 +3319,31 @@ def main():
     )
 
     logger.info(
-        "Reply + Username + User ID + Mention"
+        "Global Ban Words"
+    )
+
+    logger.info(
+        "Global Link Filter"
+    )
+
+    logger.info(
+        "Phone + Email Filter"
+    )
+
+    logger.info(
+        "Telegram Invite Filter"
+    )
+
+    logger.info(
+        "Anti-Spam"
+    )
+
+    logger.info(
+        "Unique Link Logging"
+    )
+
+    logger.info(
+        "Admin Management"
     )
 
     logger.info(
@@ -1687,6 +3354,11 @@ def main():
     logger.info(
         "LOGS GROUP: %s",
         LOGS_GROUP_ID,
+    )
+
+    logger.info(
+        "BAN WORDS: %s",
+        len(ban_words_cache),
     )
 
     logger.info(
