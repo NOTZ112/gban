@@ -121,25 +121,32 @@ settings_col = db["settings"]
 # INDEXES
 # =========================================================
 
+# Username lookup
 users_col.create_index(
     "username",
     sparse=True,
 )
 
+# Global ban words
 ban_words_col.create_index(
     "word",
     unique=True,
 )
 
+# Unique link logging
 logged_links_col.create_index(
     "normalized_url",
     unique=True,
 )
 
-admins_col.create_index(
-    "_id",
-    unique=True,
-)
+# IMPORTANT:
+# DO NOT create an explicit unique index on "_id".
+# MongoDB automatically creates the "_id_" unique index.
+#
+# OLD / WRONG:
+# admins_col.create_index("_id", unique=True)
+#
+# It has intentionally been removed.
 
 
 # =========================================================
@@ -1485,11 +1492,9 @@ async def panel_callback(
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    # =====================================================
-    # IMPORTANT FIX
-    # global MUST be declared before using the variable
+    # IMPORTANT:
+    # global MUST be declared before using ANTISPAM_ENABLED
     # anywhere inside this function.
-    # =====================================================
 
     global ANTISPAM_ENABLED
 
@@ -1498,9 +1503,11 @@ async def panel_callback(
     if not query:
         return
 
-    await query.answer()
-
     user = query.from_user
+
+    # -----------------------------------------------------
+    # AUTH CHECK BEFORE ANSWERING CALLBACK
+    # -----------------------------------------------------
 
     if not is_admin(user.id):
 
@@ -1510,6 +1517,9 @@ async def panel_callback(
         )
 
         return
+
+    # Answer exactly once
+    await query.answer()
 
     data = query.data
 
@@ -1780,10 +1790,6 @@ async def panel_callback(
     # -----------------------------------------------------
 
     if data == "spam_on":
-
-        # FIXED:
-        # No 'global ANTISPAM_ENABLED' here.
-        # It is already declared at the top of this function.
 
         ANTISPAM_ENABLED = True
 
@@ -3163,7 +3169,7 @@ def load_settings():
         {"_id": "antispam"}
     )
 
-    if data is not None:
+    if data:
 
         ANTISPAM_ENABLED = bool(
             data.get(
@@ -3174,6 +3180,7 @@ def load_settings():
 
     else:
 
+        # Default = ON
         ANTISPAM_ENABLED = True
 
 
@@ -3183,6 +3190,7 @@ def load_settings():
 
 def main():
 
+    # Load persistent settings before starting bot
     load_ban_words()
     load_settings()
 
