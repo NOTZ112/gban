@@ -78,7 +78,7 @@ ANTISPAM_ENABLED = True
 ANTISPAM_LIMIT = 10
 ANTISPAM_WINDOW = 5
 
-# Maximum number of remembered timestamps per user
+# Maximum remembered timestamps per user
 ANTISPAM_MEMORY = 30
 
 
@@ -108,16 +108,18 @@ db = mongo["global_ban_bot"]
 chats_col = db["chats"]
 users_col = db["users"]
 
-# Existing
 global_bans_col = db["global_bans"]
 global_mutes_col = db["global_mutes"]
 
-# New
 admins_col = db["admins"]
 ban_words_col = db["ban_words"]
 logged_links_col = db["logged_links"]
 settings_col = db["settings"]
 
+
+# =========================================================
+# INDEXES
+# =========================================================
 
 users_col.create_index(
     "username",
@@ -145,7 +147,6 @@ admins_col.create_index(
 # =========================================================
 
 spam_tracker = {}
-
 ban_words_cache = set()
 
 
@@ -583,7 +584,6 @@ def normalize_ban_word(text: str):
 
     text = text.lower().strip()
 
-    # Collapse spaces
     text = re.sub(
         r"\s+",
         " ",
@@ -620,7 +620,7 @@ def add_ban_word(word: str, admin_id: int):
     if not normalized:
         return False
 
-    result = ban_words_col.update_one(
+    ban_words_col.update_one(
         {"word": normalized},
         {
             "$set": {
@@ -659,7 +659,6 @@ def message_has_ban_word(text: str):
 
     for word in ban_words_cache:
 
-        # Word boundary for normal words
         pattern = (
             r"(?<!\w)"
             + re.escape(word)
@@ -691,7 +690,6 @@ URL_PATTERN = re.compile(
 )
 
 
-# Generic domain pattern
 DOMAIN_PATTERN = re.compile(
     r"(?i)\b"
     r"(?:[a-z0-9-]+\.)+"
@@ -736,9 +734,12 @@ def extract_links(text: str):
     found = []
 
     for match in URL_PATTERN.findall(text):
-        found.append(match)
+
+        if match not in found:
+            found.append(match)
 
     for match in DOMAIN_PATTERN.findall(text):
+
         if match not in found:
             found.append(match)
 
@@ -752,15 +753,14 @@ def normalize_url(url: str):
 
     url = url.strip()
 
-    # Remove common punctuation from sentence ending
     url = url.rstrip(
         ".,!?;:)]}>\"'"
     )
 
     url = url.lower()
 
-    # Add scheme for normalization
     if url.startswith("www."):
+
         url = "https://" + url
 
     elif not re.match(
@@ -768,14 +768,15 @@ def normalize_url(url: str):
         url,
         re.IGNORECASE,
     ):
+
         if re.match(
             r"^(t\.me|telegram\.me|telegram\.dog)/",
             url,
             re.IGNORECASE,
         ):
+
             url = "https://" + url
 
-    # Remove trailing slash
     url = url.rstrip("/")
 
     return url
@@ -834,7 +835,6 @@ async def log_deleted_link(
     if not normalized:
         return
 
-    # Atomic duplicate protection
     try:
 
         result = logged_links_col.update_one(
@@ -856,13 +856,11 @@ async def log_deleted_link(
             upsert=True,
         )
 
-        # Already existed
         if result.matched_count > 0:
             return
 
     except Exception as e:
 
-        # Duplicate key means already logged
         if "duplicate" in str(e).lower():
             return
 
@@ -870,6 +868,7 @@ async def log_deleted_link(
             "LINK LOG DB ERROR: %s",
             e,
         )
+
         return
 
     user_display = (
@@ -939,7 +938,6 @@ def check_antispam(
         [],
     )
 
-    # Keep only recent messages
     timestamps = [
         t
         for t in timestamps
@@ -948,7 +946,6 @@ def check_antispam(
 
     timestamps.append(now)
 
-    # Prevent unlimited memory
     timestamps = timestamps[
         -ANTISPAM_MEMORY:
     ]
@@ -985,7 +982,6 @@ async def moderation_message(
     if not message or not chat or not user:
         return
 
-    # Only groups/supergroups
     if chat.type not in (
         "group",
         "supergroup",
@@ -999,13 +995,16 @@ async def moderation_message(
     save_chat(chat)
 
     # -----------------------------------------------------
-    # OWNER / BOT ADMINS PROTECTED
+    # OWNER PROTECTED
     # -----------------------------------------------------
 
     if is_owner(user.id):
         return
 
-    # If user is Telegram group admin, don't filter
+    # -----------------------------------------------------
+    # TELEGRAM GROUP ADMINS PROTECTED
+    # -----------------------------------------------------
+
     try:
 
         member = await context.bot.get_chat_member(
@@ -1017,13 +1016,14 @@ async def moderation_message(
             ChatMemberStatus.ADMINISTRATOR,
             ChatMemberStatus.OWNER,
         ):
+
             return
 
     except TelegramError:
         pass
 
     # -----------------------------------------------------
-    # MESSAGE TEXT + CAPTION
+    # MESSAGE TEXT / CAPTION
     # -----------------------------------------------------
 
     text = (
@@ -1240,7 +1240,6 @@ async def user_membership_update(
         return
 
     member = event.new_chat_member
-
     user = member.user
 
     if not user:
@@ -1259,9 +1258,9 @@ async def user_membership_update(
         ChatMemberStatus.OWNER,
     ):
 
-        # =================================================
+        # -------------------------------------------------
         # GLOBAL BAN CHECK
-        # =================================================
+        # -------------------------------------------------
 
         if is_global_banned(user.id):
 
@@ -1303,9 +1302,9 @@ async def user_membership_update(
                     e,
                 )
 
-        # =================================================
+        # -------------------------------------------------
         # GLOBAL MUTE CHECK
-        # =================================================
+        # -------------------------------------------------
 
         if is_global_muted(user.id):
 
@@ -1373,6 +1372,7 @@ async def start(
 ):
 
     if update.effective_user:
+
         save_user(
             update.effective_user
         )
@@ -1463,6 +1463,7 @@ async def panel(
         await update.message.reply_text(
             "❌ You are not authorized."
         )
+
         return
 
     save_user(user)
@@ -1484,6 +1485,14 @@ async def panel_callback(
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
+    # =====================================================
+    # IMPORTANT FIX
+    # global MUST be declared before using the variable
+    # anywhere inside this function.
+    # =====================================================
+
+    global ANTISPAM_ENABLED
+
     query = update.callback_query
 
     if not query:
@@ -1499,6 +1508,7 @@ async def panel_callback(
             "❌ Not authorized.",
             show_alert=True,
         )
+
         return
 
     data = query.data
@@ -1771,7 +1781,9 @@ async def panel_callback(
 
     if data == "spam_on":
 
-        global ANTISPAM_ENABLED
+        # FIXED:
+        # No 'global ANTISPAM_ENABLED' here.
+        # It is already declared at the top of this function.
 
         ANTISPAM_ENABLED = True
 
@@ -1851,6 +1863,7 @@ async def panel_callback(
                 "Only Owner can manage admins.",
                 show_alert=True,
             )
+
             return
 
         count = admins_col.count_documents({})
@@ -1982,10 +1995,13 @@ async def panel_callback(
                     )
 
                     if username:
+
                         display = (
                             f"@{escape(username)}"
                         )
+
                     else:
+
                         display = escape(name)
 
                 else:
@@ -2080,10 +2096,12 @@ async def panel_text_input(
         return
 
     if not is_admin(user.id):
+
         context.user_data.pop(
             "panel_action",
             None,
         )
+
         return
 
     text = (
@@ -2165,6 +2183,7 @@ async def panel_text_input(
             await message.reply_text(
                 "❌ Owner only."
             )
+
             return
 
         try:
@@ -2176,6 +2195,7 @@ async def panel_text_input(
             await message.reply_text(
                 "❌ Invalid User ID."
             )
+
             return
 
         if is_owner(admin_id):
@@ -2183,6 +2203,7 @@ async def panel_text_input(
             await message.reply_text(
                 "ℹ️ This user is already an Owner."
             )
+
             return
 
         admins_col.update_one(
@@ -2220,6 +2241,7 @@ async def panel_text_input(
             await message.reply_text(
                 "❌ Owner only."
             )
+
             return
 
         try:
@@ -2231,6 +2253,7 @@ async def panel_text_input(
             await message.reply_text(
                 "❌ Invalid User ID."
             )
+
             return
 
         if is_owner(admin_id):
@@ -2238,6 +2261,7 @@ async def panel_text_input(
             await message.reply_text(
                 "❌ Owner cannot be removed."
             )
+
             return
 
         result = admins_col.delete_one(
@@ -2301,6 +2325,7 @@ async def gban(
         await update.message.reply_text(
             "❌ You are not authorized."
         )
+
         return
 
     save_user(admin)
@@ -2332,12 +2357,12 @@ async def gban(
 
         return
 
-    # Prevent admin/owner GBAN accidentally
     if is_owner(user_id):
 
         await update.message.reply_text(
             "❌ Owner cannot be globally banned."
         )
+
         return
 
     reason = get_reason(
@@ -2498,6 +2523,7 @@ async def ungban(
         await update.message.reply_text(
             "❌ You are not authorized."
         )
+
         return
 
     save_user(admin)
@@ -2674,6 +2700,7 @@ async def gmute(
         await update.message.reply_text(
             "❌ You are not authorized."
         )
+
         return
 
     save_user(admin)
@@ -2708,6 +2735,7 @@ async def gmute(
         await update.message.reply_text(
             "❌ Owner cannot be globally muted."
         )
+
         return
 
     reason = get_reason(
@@ -2883,6 +2911,7 @@ async def ungmute(
         await update.message.reply_text(
             "❌ You are not authorized."
         )
+
         return
 
     save_user(admin)
@@ -3076,6 +3105,7 @@ async def chats(
         await update.message.reply_text(
             "❌ You are not authorized."
         )
+
         return
 
     all_chats = list(
@@ -3134,12 +3164,17 @@ def load_settings():
     )
 
     if data is not None:
+
         ANTISPAM_ENABLED = bool(
             data.get(
                 "enabled",
                 True,
             )
         )
+
+    else:
+
+        ANTISPAM_ENABLED = True
 
 
 # =========================================================
@@ -3250,8 +3285,6 @@ def main():
 
     # -----------------------------------------------------
     # PANEL TEXT INPUT
-    # IMPORTANT:
-    # This is before moderation handler.
     # -----------------------------------------------------
 
     app.add_handler(
@@ -3299,7 +3332,7 @@ def main():
     )
 
     # -----------------------------------------------------
-    # START
+    # START LOG
     # -----------------------------------------------------
 
     logger.info(
@@ -3359,6 +3392,11 @@ def main():
     logger.info(
         "BAN WORDS: %s",
         len(ban_words_cache),
+    )
+
+    logger.info(
+        "ANTISPAM: %s",
+        "ON" if ANTISPAM_ENABLED else "OFF",
     )
 
     logger.info(
