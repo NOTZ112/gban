@@ -121,19 +121,16 @@ settings_col = db["settings"]
 # INDEXES
 # =========================================================
 
-# Username lookup
 users_col.create_index(
     "username",
     sparse=True,
 )
 
-# Global ban words
 ban_words_col.create_index(
     "word",
     unique=True,
 )
 
-# Unique link logging
 logged_links_col.create_index(
     "normalized_url",
     unique=True,
@@ -142,11 +139,6 @@ logged_links_col.create_index(
 # IMPORTANT:
 # DO NOT create an explicit unique index on "_id".
 # MongoDB automatically creates the "_id_" unique index.
-#
-# OLD / WRONG:
-# admins_col.create_index("_id", unique=True)
-#
-# It has intentionally been removed.
 
 
 # =========================================================
@@ -620,41 +612,129 @@ def load_ban_words():
     )
 
 
-def add_ban_word(word: str, admin_id: int):
+def add_ban_word(
+    word: str,
+    admin_id: int,
+):
 
     normalized = normalize_ban_word(word)
 
     if not normalized:
         return False
 
-    ban_words_col.update_one(
-        {"word": normalized},
-        {
-            "$set": {
-                "word": normalized,
-                "added_by": admin_id,
-                "created_at": datetime.utcnow(),
-            }
-        },
-        upsert=True,
-    )
+    try:
 
-    ban_words_cache.add(normalized)
+        ban_words_col.update_one(
+            {"word": normalized},
+            {
+                "$set": {
+                    "word": normalized,
+                    "added_by": admin_id,
+                    "created_at": datetime.utcnow(),
+                }
+            },
+            upsert=True,
+        )
 
-    return True
+        ban_words_cache.add(normalized)
+
+        logger.info(
+            "BAN WORD ADDED | word=%s | admin=%s",
+            normalized,
+            admin_id,
+        )
+
+        return True
+
+    except Exception as e:
+
+        logger.exception(
+            "BAN WORD ADD FAILED | %s",
+            e,
+        )
+
+        return False
 
 
 def remove_ban_word(word: str):
 
     normalized = normalize_ban_word(word)
 
-    result = ban_words_col.delete_one(
+    if not normalized:
+        return False
+
+    # -----------------------------------------------------
+    # First try exact normalized value
+    # -----------------------------------------------------
+
+    result = ban_words_col.delete_many(
         {"word": normalized}
     )
 
+    if result.deleted_count > 0:
+
+        load_ban_words()
+
+        logger.info(
+            "BAN WORD REMOVED | word=%s | deleted=%s",
+            normalized,
+            result.deleted_count,
+        )
+
+        return True
+
+    # -----------------------------------------------------
+    # Also support old/legacy entries that may have
+    # different capitalization or spacing.
+    # -----------------------------------------------------
+
+    matching_ids = []
+
+    for doc in ban_words_col.find(
+        {},
+        {
+            "_id": 1,
+            "word": 1,
+        },
+    ):
+
+        stored_word = normalize_ban_word(
+            doc.get("word", "")
+        )
+
+        if stored_word == normalized:
+            matching_ids.append(
+                doc["_id"]
+            )
+
+    if matching_ids:
+
+        result = ban_words_col.delete_many(
+            {
+                "_id": {
+                    "$in": matching_ids
+                }
+            }
+        )
+
+        load_ban_words()
+
+        logger.info(
+            "BAN WORD REMOVED LEGACY | word=%s | deleted=%s",
+            normalized,
+            result.deleted_count,
+        )
+
+        return result.deleted_count > 0
+
     ban_words_cache.discard(normalized)
 
-    return result.deleted_count > 0
+    logger.info(
+        "BAN WORD NOT FOUND | word=%s",
+        normalized,
+    )
+
+    return False
 
 
 def message_has_ban_word(text: str):
@@ -665,6 +745,9 @@ def message_has_ban_word(text: str):
     normalized_text = text.lower()
 
     for word in ban_words_cache:
+
+        if not word:
+            continue
 
         pattern = (
             r"(?<!\w)"
@@ -677,6 +760,12 @@ def message_has_ban_word(text: str):
             normalized_text,
             re.IGNORECASE,
         ):
+
+            logger.info(
+                "BAN WORD MATCHED | word=%s",
+                word,
+            )
+
             return True
 
     return False
@@ -1052,10 +1141,21 @@ async def moderation_message(
 
             await message.delete()
 
+        except Forbidden as e:
+
+            logger.warning(
+                "SPAM DELETE FORBIDDEN | Chat=%s | User=%s | %s",
+                chat.id,
+                user.id,
+                e,
+            )
+
         except TelegramError as e:
 
-            logger.debug(
-                "SPAM DELETE FAILED | %s",
+            logger.warning(
+                "SPAM DELETE FAILED | Chat=%s | User=%s | %s",
+                chat.id,
+                user.id,
                 e,
             )
 
@@ -1071,10 +1171,28 @@ async def moderation_message(
 
             await message.delete()
 
+            logger.info(
+                "BAN WORD MESSAGE DELETED | Chat=%s | User=%s | Message=%s",
+                chat.id,
+                user.id,
+                message.message_id,
+            )
+
+        except Forbidden as e:
+
+            logger.warning(
+                "BAN WORD DELETE FORBIDDEN | Chat=%s | User=%s | %s",
+                chat.id,
+                user.id,
+                e,
+            )
+
         except TelegramError as e:
 
-            logger.debug(
-                "BAN WORD DELETE FAILED | %s",
+            logger.warning(
+                "BAN WORD DELETE FAILED | Chat=%s | User=%s | %s",
+                chat.id,
+                user.id,
                 e,
             )
 
@@ -1090,10 +1208,21 @@ async def moderation_message(
 
             await message.delete()
 
+        except Forbidden as e:
+
+            logger.warning(
+                "EMAIL DELETE FORBIDDEN | Chat=%s | User=%s | %s",
+                chat.id,
+                user.id,
+                e,
+            )
+
         except TelegramError as e:
 
-            logger.debug(
-                "EMAIL DELETE FAILED | %s",
+            logger.warning(
+                "EMAIL DELETE FAILED | Chat=%s | User=%s | %s",
+                chat.id,
+                user.id,
                 e,
             )
 
@@ -1109,10 +1238,21 @@ async def moderation_message(
 
             await message.delete()
 
+        except Forbidden as e:
+
+            logger.warning(
+                "PHONE DELETE FORBIDDEN | Chat=%s | User=%s | %s",
+                chat.id,
+                user.id,
+                e,
+            )
+
         except TelegramError as e:
 
-            logger.debug(
-                "PHONE DELETE FAILED | %s",
+            logger.warning(
+                "PHONE DELETE FAILED | Chat=%s | User=%s | %s",
+                chat.id,
+                user.id,
                 e,
             )
 
@@ -1139,10 +1279,21 @@ async def moderation_message(
 
             await message.delete()
 
+        except Forbidden as e:
+
+            logger.warning(
+                "TELEGRAM INVITE DELETE FORBIDDEN | Chat=%s | User=%s | %s",
+                chat.id,
+                user.id,
+                e,
+            )
+
         except TelegramError as e:
 
-            logger.debug(
-                "TELEGRAM INVITE DELETE FAILED | %s",
+            logger.warning(
+                "TELEGRAM INVITE DELETE FAILED | Chat=%s | User=%s | %s",
+                chat.id,
+                user.id,
                 e,
             )
 
@@ -1169,10 +1320,21 @@ async def moderation_message(
 
             await message.delete()
 
+        except Forbidden as e:
+
+            logger.warning(
+                "LINK DELETE FORBIDDEN | Chat=%s | User=%s | %s",
+                chat.id,
+                user.id,
+                e,
+            )
+
         except TelegramError as e:
 
-            logger.debug(
-                "LINK DELETE FAILED | %s",
+            logger.warning(
+                "LINK DELETE FAILED | Chat=%s | User=%s | %s",
+                chat.id,
+                user.id,
                 e,
             )
 
@@ -1492,10 +1654,6 @@ async def panel_callback(
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    # IMPORTANT:
-    # global MUST be declared before using ANTISPAM_ENABLED
-    # anywhere inside this function.
-
     global ANTISPAM_ENABLED
 
     query = update.callback_query
@@ -1506,7 +1664,7 @@ async def panel_callback(
     user = query.from_user
 
     # -----------------------------------------------------
-    # AUTH CHECK BEFORE ANSWERING CALLBACK
+    # AUTH CHECK
     # -----------------------------------------------------
 
     if not is_admin(user.id):
@@ -1518,7 +1676,7 @@ async def panel_callback(
 
         return
 
-    # Answer exactly once
+    # Answer callback exactly once
     await query.answer()
 
     data = query.data
@@ -1528,6 +1686,11 @@ async def panel_callback(
     # -----------------------------------------------------
 
     if data == "panel_home":
+
+        context.user_data.pop(
+            "panel_action",
+            None,
+        )
 
         await query.edit_message_text(
             "🛡️ <b>GBAN ADMIN PANEL</b>\n\n"
@@ -1543,6 +1706,11 @@ async def panel_callback(
     # -----------------------------------------------------
 
     if data == "panel_banwords":
+
+        context.user_data.pop(
+            "panel_action",
+            None,
+        )
 
         count = ban_words_col.count_documents({})
 
@@ -1592,13 +1760,97 @@ async def panel_callback(
 
         context.user_data["panel_action"] = "add_banword"
 
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "✅ Done",
+                        callback_data="banword_add_done",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🔙 Back",
+                        callback_data="panel_banwords",
+                    ),
+                ],
+            ]
+        )
+
         await query.edit_message_text(
-            "➕ <b>ADD GLOBAL BAN WORD</b>\n\n"
-            "Send the word now.\n\n"
-            "It will automatically apply to "
-            "<b>all current and future groups</b>.\n\n"
-            "Send /cancel to cancel.",
+            "➕ <b>ADD GLOBAL BAN WORDS</b>\n\n"
+
+            "Send banned words <b>one by one</b>.\n\n"
+
+            "Example:\n"
+            "<code>word1</code>\n"
+            "<code>word2</code>\n"
+            "<code>word3</code>\n\n"
+
+            "✅ Each word will be saved immediately.\n"
+            "🌍 Each word becomes active in all current "
+            "and future registered groups.\n\n"
+
+            "When you finish, press <b>✅ Done</b>.\n\n"
+
+            "Press <b>🔙 Back</b> to cancel.",
             parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+
+        return
+
+    # -----------------------------------------------------
+    # ADD BAN WORD DONE
+    # -----------------------------------------------------
+
+    if data == "banword_add_done":
+
+        context.user_data.pop(
+            "panel_action",
+            None,
+        )
+
+        count = ban_words_col.count_documents({})
+
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "➕ Add Ban Word",
+                        callback_data="banword_add",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🗑️ Remove Ban Word",
+                        callback_data="banword_remove",
+                    ),
+                    InlineKeyboardButton(
+                        "📋 Word List",
+                        callback_data="banword_list",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🔙 Back",
+                        callback_data="panel_home",
+                    ),
+                ],
+            ]
+        )
+
+        await query.edit_message_text(
+            "🚫 <b>GLOBAL BAN WORDS</b>\n\n"
+
+            "✅ <b>Ban word adding completed.</b>\n\n"
+
+            f"📊 Total Words: <b>{count}</b>\n\n"
+
+            "All saved words are now active "
+            "in current and future registered groups.",
+            parse_mode="HTML",
+            reply_markup=keyboard,
         )
 
         return
@@ -1611,11 +1863,23 @@ async def panel_callback(
 
         context.user_data["panel_action"] = "remove_banword"
 
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "🔙 Back",
+                        callback_data="panel_banwords",
+                    ),
+                ],
+            ]
+        )
+
         await query.edit_message_text(
             "🗑️ <b>REMOVE GLOBAL BAN WORD</b>\n\n"
             "Send the word you want to remove.\n\n"
             "Send /cancel to cancel.",
             parse_mode="HTML",
+            reply_markup=keyboard,
         )
 
         return
@@ -1654,7 +1918,7 @@ async def panel_callback(
 
                 lines.append(
                     f"{i}. <code>"
-                    f"{escape(doc['word'])}"
+                    f"{escape(doc.get('word', ''))}"
                     f"</code>"
                 )
 
@@ -1687,6 +1951,11 @@ async def panel_callback(
     # -----------------------------------------------------
 
     if data == "panel_links":
+
+        context.user_data.pop(
+            "panel_action",
+            None,
+        )
 
         count = logged_links_col.count_documents({})
 
@@ -1745,6 +2014,11 @@ async def panel_callback(
     # -----------------------------------------------------
 
     if data == "panel_spam":
+
+        context.user_data.pop(
+            "panel_action",
+            None,
+        )
 
         status = (
             "🟢 ON"
@@ -1865,12 +2139,28 @@ async def panel_callback(
 
         if not is_owner(user.id):
 
-            await query.answer(
-                "Only Owner can manage admins.",
-                show_alert=True,
+            await query.edit_message_text(
+                "❌ <b>Owner Only</b>\n\n"
+                "Only the Owner can manage admins.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                "🔙 Back",
+                                callback_data="panel_home",
+                            )
+                        ]
+                    ]
+                ),
             )
 
             return
+
+        context.user_data.pop(
+            "panel_action",
+            None,
+        )
 
         count = admins_col.count_documents({})
 
@@ -2047,6 +2337,11 @@ async def panel_callback(
 
     if data == "panel_stats":
 
+        context.user_data.pop(
+            "panel_action",
+            None,
+        )
+
         chats_count = chats_col.count_documents({})
         users_count = users_col.count_documents({})
         bans_count = global_bans_col.count_documents({})
@@ -2124,26 +2419,102 @@ async def panel_text_input(
 
     if action == "add_banword":
 
-        context.user_data.pop(
-            "panel_action",
-            None,
-        )
+        normalized = normalize_ban_word(text)
 
-        if add_ban_word(
-            text,
-            user.id,
-        ):
+        if not normalized:
+
+            await message.reply_text(
+                "❌ Invalid ban word.\n\n"
+                "Please send a valid word."
+            )
+
+            return
+
+        try:
+
+            # Check existing normalized word
+            existing = ban_words_col.find_one(
+                {
+                    "word": normalized
+                },
+                {
+                    "_id": 1
+                },
+            )
+
+            if existing:
+
+                await message.reply_text(
+                    "⚠️ <b>Already Exists</b>\n\n"
+
+                    f"🚫 Word: "
+                    f"<code>{escape(text)}</code>\n\n"
+
+                    "Send another word or press "
+                    "✅ <b>Done</b>.",
+                    parse_mode="HTML",
+                )
+
+                return
+
+            # Save immediately
+            result = ban_words_col.update_one(
+                {
+                    "word": normalized
+                },
+                {
+                    "$set": {
+                        "word": normalized,
+                        "added_by": user.id,
+                        "created_at": datetime.utcnow(),
+                    }
+                },
+                upsert=True,
+            )
+
+            # Update memory cache immediately
+            ban_words_cache.add(
+                normalized
+            )
+
+            logger.info(
+                "BAN WORD ADDED FROM PANEL | word=%s | admin=%s",
+                normalized,
+                user.id,
+            )
 
             await message.reply_text(
                 "✅ <b>Ban Word Added</b>\n\n"
-                f"🚫 Word: <code>{escape(text)}</code>\n\n"
-                "🌍 It is now active in "
-                "<b>all current and future registered groups</b>.\n\n"
+
+                f"🚫 Word: "
+                f"<code>{escape(text)}</code>\n\n"
+
+                "🌍 Active in <b>all current and "
+                "future registered groups</b>.\n\n"
+
                 "🗑️ Matching messages will be "
-                "silently deleted.",
+                "silently deleted.\n\n"
+
+                "➡️ Send the <b>next word</b>.\n"
+                "When finished press "
+                "✅ <b>Done</b>.",
                 parse_mode="HTML",
             )
 
+        except Exception as e:
+
+            logger.exception(
+                "BAN WORD PANEL ADD FAILED | %s",
+                e,
+            )
+
+            await message.reply_text(
+                "❌ Failed to save ban word."
+            )
+
+        # IMPORTANT:
+        # Do NOT remove panel_action here.
+        # This keeps multiple-add mode active.
         return
 
     # -----------------------------------------------------
@@ -2300,16 +2671,32 @@ async def cancel(
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    context.user_data.pop(
+    action = context.user_data.pop(
         "panel_action",
         None,
     )
 
     if update.message:
 
-        await update.message.reply_text(
-            "❌ Cancelled."
-        )
+        if action == "add_banword":
+
+            await update.message.reply_text(
+                "❌ <b>Ban Word Adding Cancelled</b>.",
+                parse_mode="HTML",
+            )
+
+        elif action == "remove_banword":
+
+            await update.message.reply_text(
+                "❌ <b>Ban Word Removal Cancelled</b>.",
+                parse_mode="HTML",
+            )
+
+        else:
+
+            await update.message.reply_text(
+                "❌ Cancelled."
+            )
 
 
 # =========================================================
@@ -3180,7 +3567,6 @@ def load_settings():
 
     else:
 
-        # Default = ON
         ANTISPAM_ENABLED = True
 
 
@@ -3190,9 +3576,16 @@ def load_settings():
 
 def main():
 
-    # Load persistent settings before starting bot
+    # -----------------------------------------------------
+    # LOAD PERSISTENT DATA
+    # -----------------------------------------------------
+
     load_ban_words()
     load_settings()
+
+    # -----------------------------------------------------
+    # APPLICATION
+    # -----------------------------------------------------
 
     app = (
         Application.builder()
