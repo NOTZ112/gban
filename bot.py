@@ -1780,18 +1780,23 @@ async def panel_callback(
         await query.edit_message_text(
             "➕ <b>ADD GLOBAL BAN WORDS</b>\n\n"
 
-            "Send banned words <b>one by one</b>.\n\n"
+            "Send <b>multiple banned words in one message</b>.\n"
+            "Put each word on a <b>new line</b>.\n\n"
 
             "Example:\n"
-            "<code>word1</code>\n"
-            "<code>word2</code>\n"
-            "<code>word3</code>\n\n"
+            "<code>word1\n"
+            "word2\n"
+            "word3\n"
+            "word4\n"
+            "word5</code>\n\n"
 
-            "✅ Each word will be saved immediately.\n"
-            "🌍 Each word becomes active in all current "
+            "♾️ You can add <b>as many words as you want</b> "
+            "in one message.\n\n"
+
+            "🌍 All words will become active in current "
             "and future registered groups.\n\n"
 
-            "When you finish, press <b>✅ Done</b>.\n\n"
+            "When finished, press <b>✅ Done</b>.\n\n"
 
             "Press <b>🔙 Back</b> to cancel.",
             parse_mode="HTML",
@@ -2419,102 +2424,114 @@ async def panel_text_input(
 
     if action == "add_banword":
 
-        normalized = normalize_ban_word(text)
+        # -------------------------------------------------
+        # MULTIPLE BAN WORDS FROM ONE MESSAGE
+        # Each line = one banned word
+        # -------------------------------------------------
 
-        if not normalized:
+        words = [
+            line.strip()
+            for line in text.splitlines()
+            if line.strip()
+        ]
+
+        if not words:
 
             await message.reply_text(
                 "❌ Invalid ban word.\n\n"
-                "Please send a valid word."
+                "Please send at least one valid word."
             )
 
             return
 
+        added_count = 0
+        existing_count = 0
+        failed_count = 0
+
         try:
 
-            # Check existing normalized word
-            existing = ban_words_col.find_one(
-                {
-                    "word": normalized
-                },
-                {
-                    "_id": 1
-                },
-            )
+            for word in words:
 
-            if existing:
+                normalized = normalize_ban_word(word)
 
-                await message.reply_text(
-                    "⚠️ <b>Already Exists</b>\n\n"
+                if not normalized:
+                    continue
 
-                    f"🚫 Word: "
-                    f"<code>{escape(text)}</code>\n\n"
-
-                    "Send another word or press "
-                    "✅ <b>Done</b>.",
-                    parse_mode="HTML",
+                # Check existing normalized word
+                existing = ban_words_col.find_one(
+                    {
+                        "word": normalized
+                    },
+                    {
+                        "_id": 1
+                    },
                 )
 
-                return
+                if existing:
 
-            # Save immediately
-            result = ban_words_col.update_one(
-                {
-                    "word": normalized
-                },
-                {
-                    "$set": {
-                        "word": normalized,
-                        "added_by": user.id,
-                        "created_at": datetime.utcnow(),
-                    }
-                },
-                upsert=True,
-            )
+                    existing_count += 1
+                    continue
 
-            # Update memory cache immediately
-            ban_words_cache.add(
-                normalized
-            )
+                # Save word
+                ban_words_col.update_one(
+                    {
+                        "word": normalized
+                    },
+                    {
+                        "$set": {
+                            "word": normalized,
+                            "added_by": user.id,
+                            "created_at": datetime.utcnow(),
+                        }
+                    },
+                    upsert=True,
+                )
 
-            logger.info(
-                "BAN WORD ADDED FROM PANEL | word=%s | admin=%s",
-                normalized,
-                user.id,
-            )
+                # Update memory cache immediately
+                ban_words_cache.add(
+                    normalized
+                )
 
-            await message.reply_text(
-                "✅ <b>Ban Word Added</b>\n\n"
+                added_count += 1
 
-                f"🚫 Word: "
-                f"<code>{escape(text)}</code>\n\n"
-
-                "🌍 Active in <b>all current and "
-                "future registered groups</b>.\n\n"
-
-                "🗑️ Matching messages will be "
-                "silently deleted.\n\n"
-
-                "➡️ Send the <b>next word</b>.\n"
-                "When finished press "
-                "✅ <b>Done</b>.",
-                parse_mode="HTML",
-            )
+                logger.info(
+                    "BAN WORD ADDED FROM PANEL | word=%s | admin=%s",
+                    normalized,
+                    user.id,
+                )
 
         except Exception as e:
 
+            failed_count += 1
+
             logger.exception(
-                "BAN WORD PANEL ADD FAILED | %s",
+                "BAN WORD PANEL BULK ADD FAILED | %s",
                 e,
             )
 
-            await message.reply_text(
-                "❌ Failed to save ban word."
-            )
+        total_received = len(words)
+
+        await message.reply_text(
+            "✅ <b>BAN WORDS ADDED</b>\n\n"
+
+            f"📥 Received: <b>{total_received}</b>\n"
+            f"✅ Added: <b>{added_count}</b>\n"
+            f"⚠️ Already Exists: <b>{existing_count}</b>\n"
+            f"❌ Failed: <b>{failed_count}</b>\n\n"
+
+            "🌍 All added words are active in "
+            "<b>current and future registered groups</b>.\n\n"
+
+            "➕ You can send another message with "
+            "more banned words.\n\n"
+
+            "When finished, press <b>✅ Done</b>.",
+            parse_mode="HTML",
+        )
 
         # IMPORTANT:
-        # Do NOT remove panel_action here.
-        # This keeps multiple-add mode active.
+        # Keep add_banword mode active.
+        # User can send unlimited additional messages.
         return
 
     # -----------------------------------------------------
