@@ -74,11 +74,8 @@ LOGS_GROUP_ID = int(LOGS_GROUP_ID)
 
 ANTISPAM_ENABLED = True
 
-# 10 messages in 5 seconds
 ANTISPAM_LIMIT = 10
 ANTISPAM_WINDOW = 5
-
-# Maximum remembered timestamps per user
 ANTISPAM_MEMORY = 30
 
 
@@ -135,10 +132,6 @@ logged_links_col.create_index(
     "normalized_url",
     unique=True,
 )
-
-# IMPORTANT:
-# DO NOT create an explicit unique index on "_id".
-# MongoDB automatically creates the "_id_" unique index.
 
 
 # =========================================================
@@ -663,10 +656,6 @@ def remove_ban_word(word: str):
     if not normalized:
         return False
 
-    # -----------------------------------------------------
-    # First try exact normalized value
-    # -----------------------------------------------------
-
     result = ban_words_col.delete_many(
         {"word": normalized}
     )
@@ -682,11 +671,6 @@ def remove_ban_word(word: str):
         )
 
         return True
-
-    # -----------------------------------------------------
-    # Also support old/legacy entries that may have
-    # different capitalization or spacing.
-    # -----------------------------------------------------
 
     matching_ids = []
 
@@ -1090,16 +1074,8 @@ async def moderation_message(
     save_user(user)
     save_chat(chat)
 
-    # -----------------------------------------------------
-    # OWNER PROTECTED
-    # -----------------------------------------------------
-
     if is_owner(user.id):
         return
-
-    # -----------------------------------------------------
-    # TELEGRAM GROUP ADMINS PROTECTED
-    # -----------------------------------------------------
 
     try:
 
@@ -1118,19 +1094,11 @@ async def moderation_message(
     except TelegramError:
         pass
 
-    # -----------------------------------------------------
-    # MESSAGE TEXT / CAPTION
-    # -----------------------------------------------------
-
     text = (
         message.text
         or message.caption
         or ""
     )
-
-    # -----------------------------------------------------
-    # ANTI SPAM
-    # -----------------------------------------------------
 
     if check_antispam(
         chat.id,
@@ -1160,10 +1128,6 @@ async def moderation_message(
             )
 
         return
-
-    # -----------------------------------------------------
-    # BAN WORD
-    # -----------------------------------------------------
 
     if message_has_ban_word(text):
 
@@ -1198,10 +1162,6 @@ async def moderation_message(
 
         return
 
-    # -----------------------------------------------------
-    # EMAIL
-    # -----------------------------------------------------
-
     if contains_email(text):
 
         try:
@@ -1228,10 +1188,6 @@ async def moderation_message(
 
         return
 
-    # -----------------------------------------------------
-    # PHONE
-    # -----------------------------------------------------
-
     if contains_phone(text):
 
         try:
@@ -1257,10 +1213,6 @@ async def moderation_message(
             )
 
         return
-
-    # -----------------------------------------------------
-    # TELEGRAM INVITE LINK
-    # -----------------------------------------------------
 
     if contains_telegram_invite(text):
 
@@ -1298,10 +1250,6 @@ async def moderation_message(
             )
 
         return
-
-    # -----------------------------------------------------
-    # ALL OTHER LINKS
-    # -----------------------------------------------------
 
     if contains_link(text):
 
@@ -1427,10 +1375,6 @@ async def user_membership_update(
         ChatMemberStatus.OWNER,
     ):
 
-        # -------------------------------------------------
-        # GLOBAL BAN CHECK
-        # -------------------------------------------------
-
         if is_global_banned(user.id):
 
             try:
@@ -1470,10 +1414,6 @@ async def user_membership_update(
                     chat.id,
                     e,
                 )
-
-        # -------------------------------------------------
-        # GLOBAL MUTE CHECK
-        # -------------------------------------------------
 
         if is_global_muted(user.id):
 
@@ -1663,10 +1603,6 @@ async def panel_callback(
 
     user = query.from_user
 
-    # -----------------------------------------------------
-    # AUTH CHECK
-    # -----------------------------------------------------
-
     if not is_admin(user.id):
 
         await query.answer(
@@ -1676,14 +1612,9 @@ async def panel_callback(
 
         return
 
-    # Answer callback exactly once
     await query.answer()
 
     data = query.data
-
-    # -----------------------------------------------------
-    # MAIN PANEL
-    # -----------------------------------------------------
 
     if data == "panel_home":
 
@@ -1700,10 +1631,6 @@ async def panel_callback(
         )
 
         return
-
-    # -----------------------------------------------------
-    # BAN WORD PANEL
-    # -----------------------------------------------------
 
     if data == "panel_banwords":
 
@@ -1752,10 +1679,6 @@ async def panel_callback(
 
         return
 
-    # -----------------------------------------------------
-    # ADD BAN WORD
-    # -----------------------------------------------------
-
     if data == "banword_add":
 
         context.user_data["panel_action"] = "add_banword"
@@ -1779,35 +1702,25 @@ async def panel_callback(
 
         await query.edit_message_text(
             "➕ <b>ADD GLOBAL BAN WORDS</b>\n\n"
-
             "Send <b>multiple banned words in one message</b>.\n"
             "Put each word on a <b>new line</b>.\n\n"
-
             "Example:\n"
             "<code>word1\n"
             "word2\n"
             "word3\n"
             "word4\n"
             "word5</code>\n\n"
-
             "♾️ You can add <b>as many words as you want</b> "
             "in one message.\n\n"
-
             "🌍 All words will become active in current "
             "and future registered groups.\n\n"
-
             "When finished, press <b>✅ Done</b>.\n\n"
-
             "Press <b>🔙 Back</b> to cancel.",
             parse_mode="HTML",
             reply_markup=keyboard,
         )
 
         return
-
-    # -----------------------------------------------------
-    # ADD BAN WORD DONE
-    # -----------------------------------------------------
 
     if data == "banword_add_done":
 
@@ -1847,11 +1760,8 @@ async def panel_callback(
 
         await query.edit_message_text(
             "🚫 <b>GLOBAL BAN WORDS</b>\n\n"
-
             "✅ <b>Ban word adding completed.</b>\n\n"
-
             f"📊 Total Words: <b>{count}</b>\n\n"
-
             "All saved words are now active "
             "in current and future registered groups.",
             parse_mode="HTML",
@@ -1859,10 +1769,6 @@ async def panel_callback(
         )
 
         return
-
-    # -----------------------------------------------------
-    # REMOVE BAN WORD
-    # -----------------------------------------------------
 
     if data == "banword_remove":
 
@@ -1888,10 +1794,6 @@ async def panel_callback(
         )
 
         return
-
-    # -----------------------------------------------------
-    # LIST BAN WORDS
-    # -----------------------------------------------------
 
     if data == "banword_list":
 
@@ -1951,10 +1853,6 @@ async def panel_callback(
 
         return
 
-    # -----------------------------------------------------
-    # LINK PANEL
-    # -----------------------------------------------------
-
     if data == "panel_links":
 
         context.user_data.pop(
@@ -1999,10 +1897,6 @@ async def panel_callback(
 
         return
 
-    # -----------------------------------------------------
-    # LINK COUNT
-    # -----------------------------------------------------
-
     if data == "link_count":
 
         count = logged_links_col.count_documents({})
@@ -2013,10 +1907,6 @@ async def panel_callback(
         )
 
         return
-
-    # -----------------------------------------------------
-    # ANTISPAM
-    # -----------------------------------------------------
 
     if data == "panel_spam":
 
@@ -2064,10 +1954,6 @@ async def panel_callback(
 
         return
 
-    # -----------------------------------------------------
-    # SPAM ON
-    # -----------------------------------------------------
-
     if data == "spam_on":
 
         ANTISPAM_ENABLED = True
@@ -2101,10 +1987,6 @@ async def panel_callback(
 
         return
 
-    # -----------------------------------------------------
-    # SPAM OFF
-    # -----------------------------------------------------
-
     if data == "spam_off":
 
         ANTISPAM_ENABLED = False
@@ -2135,10 +2017,6 @@ async def panel_callback(
         )
 
         return
-
-    # -----------------------------------------------------
-    # ADMIN MANAGEMENT
-    # -----------------------------------------------------
 
     if data == "panel_admins":
 
@@ -2206,10 +2084,6 @@ async def panel_callback(
 
         return
 
-    # -----------------------------------------------------
-    # ADD ADMIN
-    # -----------------------------------------------------
-
     if data == "admin_add":
 
         if not is_owner(user.id):
@@ -2228,10 +2102,6 @@ async def panel_callback(
 
         return
 
-    # -----------------------------------------------------
-    # REMOVE ADMIN
-    # -----------------------------------------------------
-
     if data == "admin_remove":
 
         if not is_owner(user.id):
@@ -2242,15 +2112,13 @@ async def panel_callback(
         await query.edit_message_text(
             "➖ <b>REMOVE ADMIN</b>\n\n"
             "Send the Telegram User ID.\n\n"
+            "Example:\n"
+            "<code>123456789</code>\n\n"
             "Send /cancel to cancel.",
             parse_mode="HTML",
         )
 
         return
-
-    # -----------------------------------------------------
-    # ADMIN LIST
-    # -----------------------------------------------------
 
     if data == "admin_list":
 
@@ -2336,10 +2204,6 @@ async def panel_callback(
 
         return
 
-    # -----------------------------------------------------
-    # STATISTICS
-    # -----------------------------------------------------
-
     if data == "panel_stats":
 
         context.user_data.pop(
@@ -2356,7 +2220,6 @@ async def panel_callback(
 
         await query.edit_message_text(
             "📊 <b>GBAN BOT STATISTICS</b>\n\n"
-
             f"👥 Users: <b>{users_count}</b>\n"
             f"💬 Registered Groups: <b>{chats_count}</b>\n"
             f"🔨 Global Bans: <b>{bans_count}</b>\n"
@@ -2418,16 +2281,7 @@ async def panel_text_input(
     if not text:
         return
 
-    # -----------------------------------------------------
-    # ADD BAN WORD
-    # -----------------------------------------------------
-
     if action == "add_banword":
-
-        # -------------------------------------------------
-        # MULTIPLE BAN WORDS FROM ONE MESSAGE
-        # Each line = one banned word
-        # -------------------------------------------------
 
         words = [
             line.strip()
@@ -2457,7 +2311,6 @@ async def panel_text_input(
                 if not normalized:
                     continue
 
-                # Check existing normalized word
                 existing = ban_words_col.find_one(
                     {
                         "word": normalized
@@ -2472,7 +2325,6 @@ async def panel_text_input(
                     existing_count += 1
                     continue
 
-                # Save word
                 ban_words_col.update_one(
                     {
                         "word": normalized
@@ -2487,7 +2339,6 @@ async def panel_text_input(
                     upsert=True,
                 )
 
-                # Update memory cache immediately
                 ban_words_cache.add(
                     normalized
                 )
@@ -2513,30 +2364,19 @@ async def panel_text_input(
 
         await message.reply_text(
             "✅ <b>BAN WORDS ADDED</b>\n\n"
-
             f"📥 Received: <b>{total_received}</b>\n"
             f"✅ Added: <b>{added_count}</b>\n"
             f"⚠️ Already Exists: <b>{existing_count}</b>\n"
             f"❌ Failed: <b>{failed_count}</b>\n\n"
-
             "🌍 All added words are active in "
             "<b>current and future registered groups</b>.\n\n"
-
             "➕ You can send another message with "
             "more banned words.\n\n"
-
             "When finished, press <b>✅ Done</b>.",
             parse_mode="HTML",
         )
 
-        # IMPORTANT:
-        # Keep add_banword mode active.
-        # User can send unlimited additional messages.
         return
-
-    # -----------------------------------------------------
-    # REMOVE BAN WORD
-    # -----------------------------------------------------
 
     if action == "remove_banword":
 
@@ -2560,10 +2400,6 @@ async def panel_text_input(
             )
 
         return
-
-    # -----------------------------------------------------
-    # ADD ADMIN
-    # -----------------------------------------------------
 
     if action == "add_admin":
 
@@ -2618,10 +2454,6 @@ async def panel_text_input(
         )
 
         return
-
-    # -----------------------------------------------------
-    # REMOVE ADMIN
-    # -----------------------------------------------------
 
     if action == "remove_admin":
 
@@ -2879,19 +2711,15 @@ async def gban(
 
         await asyncio.sleep(0.15)
 
+    # =====================================================
+    # ONLY SOURCE GROUP MESSAGE CHANGED
+    # LOG GROUP MESSAGE REMAINS EXACTLY THE SAME
+    # =====================================================
+
     result = (
-        "🔨 <b>GLOBAL BAN COMPLETED</b>\n\n"
-
-        f"👤 <b>Target:</b> {target_mention}\n"
-        f"🆔 <b>ID:</b> <code>{user_id}</code>\n\n"
-
-        "🛡️ <b>Permanent Global Ban: ON</b>\n"
-        "🚫 Future joins: <b>AUTO BAN</b>\n\n"
-
-        f"📦 <b>Total:</b> {total}\n"
-        f"✅ <b>Banned:</b> {banned}\n"
-        f"⏭ <b>Skipped:</b> {skipped}\n"
-        f"❌ <b>Failed:</b> {failed}"
+        "🔨 <b>Gbanned...</b>\n"
+        f"👤 <b>Name:</b> {target_mention}\n"
+        f"📦 <b>Groups:</b> {banned}"
     )
 
     await status_message.edit_text(
@@ -3593,26 +3421,14 @@ def load_settings():
 
 def main():
 
-    # -----------------------------------------------------
-    # LOAD PERSISTENT DATA
-    # -----------------------------------------------------
-
     load_ban_words()
     load_settings()
-
-    # -----------------------------------------------------
-    # APPLICATION
-    # -----------------------------------------------------
 
     app = (
         Application.builder()
         .token(BOT_TOKEN)
         .build()
     )
-
-    # -----------------------------------------------------
-    # COMMANDS
-    # -----------------------------------------------------
 
     app.add_handler(
         CommandHandler(
@@ -3691,19 +3507,11 @@ def main():
         )
     )
 
-    # -----------------------------------------------------
-    # PANEL CALLBACKS
-    # -----------------------------------------------------
-
     app.add_handler(
         CallbackQueryHandler(
             panel_callback,
         )
     )
-
-    # -----------------------------------------------------
-    # PANEL TEXT INPUT
-    # -----------------------------------------------------
 
     app.add_handler(
         MessageHandler(
@@ -3715,10 +3523,6 @@ def main():
         group=0,
     )
 
-    # -----------------------------------------------------
-    # GROUP MODERATION
-    # -----------------------------------------------------
-
     app.add_handler(
         MessageHandler(
             filters.ChatType.GROUPS,
@@ -3727,10 +3531,6 @@ def main():
         group=1,
     )
 
-    # -----------------------------------------------------
-    # BOT JOIN / LEAVE
-    # -----------------------------------------------------
-
     app.add_handler(
         ChatMemberHandler(
             bot_membership_update,
@@ -3738,20 +3538,12 @@ def main():
         )
     )
 
-    # -----------------------------------------------------
-    # USER JOIN / LEAVE
-    # -----------------------------------------------------
-
     app.add_handler(
         ChatMemberHandler(
             user_membership_update,
             ChatMemberHandler.CHAT_MEMBER,
         )
     )
-
-    # -----------------------------------------------------
-    # START LOG
-    # -----------------------------------------------------
 
     logger.info(
         "================================="
@@ -3820,10 +3612,6 @@ def main():
     logger.info(
         "================================="
     )
-
-    # -----------------------------------------------------
-    # POLLING
-    # -----------------------------------------------------
 
     app.run_polling(
         allowed_updates=Update.ALL_TYPES
