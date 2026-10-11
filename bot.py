@@ -3613,9 +3613,12 @@ def main():
         "================================="
     )
 
-    app.run_polling(
-        allowed_updates=Update.ALL_TYPES
-    )
+    
+app.run_polling(
+    allowed_updates=Update.ALL_TYPES,
+    drop_pending_updates=True,
+)
+
 
 
 # =========================================================
